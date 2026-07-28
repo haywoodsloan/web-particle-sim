@@ -1,0 +1,141 @@
+:root {
+  color-scheme: dark;
+  background: #000000;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: #000000;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  isolation: isolate;
+}
+
+#particle-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #000000;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+#particle-canvas.is-emission-disabled {
+  cursor: default;
+}
+
+#particle-canvas.has-pointer-hole {
+  cursor: none;
+}
+
+#pointer-hole {
+  position: fixed;
+  z-index: 1;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.65);
+  transition:
+    opacity 80ms ease-out,
+    transform 80ms ease-out;
+}
+
+#pointer-hole::before {
+  content: '';
+  position: absolute;
+  inset: -7px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  opacity: 0.45;
+}
+
+#pointer-hole.is-active {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+#pointer-hole.is-black-hole {
+  color: #ffffff;
+  background: #000000;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.7);
+}
+
+#pointer-hole.is-white-hole {
+  color: #ffffff;
+  background: #ffffff;
+  border: 1px solid #000000;
+  box-shadow:
+    0 0 10px 3px rgba(255, 255, 255, 0.9),
+    0 0 26px 6px rgba(255, 255, 255, 0.45);
+}
+
+#control-status {
+  position: fixed;
+  z-index: 1;
+  left: 50%;
+  bottom: max(40px, env(safe-area-inset-bottom));
+  max-width: calc(100% - 32px);
+  color: #38f58a;
+  font-family: 'Trebuchet MS', 'Aptos Display', sans-serif;
+  font-size: 42px;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0;
+  text-align: center;
+  text-shadow: 0 0 14px rgba(56, 245, 138, 0.42);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, 10px);
+}
+
+#control-status.is-visible {
+  animation: control-status-flash 4s ease-out forwards;
+}
+
+@keyframes control-status-flash {
+  0%,
+  50% {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+}
+
+@media (max-width: 600px) {
+  #control-status {
+    bottom: max(28px, env(safe-area-inset-bottom));
+    font-size: 30px;
+  }
+}
+
+@media (pointer: coarse) {
+  #particle-canvas {
+    cursor: default;
+  }
+}
