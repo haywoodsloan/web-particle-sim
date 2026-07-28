@@ -107,7 +107,7 @@ body {
   white-space: nowrap;
   pointer-events: none;
   opacity: 0;
-  transform: translate(-50%, 10px);
+  transform: translateX(-50%);
 }
 
 #control-status.is-visible {
@@ -118,12 +118,10 @@ body {
   0%,
   50% {
     opacity: 1;
-    transform: translate(-50%, 0);
   }
 
   100% {
     opacity: 0;
-    transform: translate(-50%, -8px);
   }
 }
 
