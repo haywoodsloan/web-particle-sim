@@ -17,13 +17,30 @@ const PARTICLE_GRAVITY = 4e-8
 const MAX_WORLD_GRAVITY = 1
 const MAX_AIR_RESISTANCE = 0.03
 const EMISSION_VELOCITY_SCALE = 0.72
-const POINTER_HOLE_RADIUS = 500
+const FULL_BRIGHTNESS_SPEED = 10
+const POINTER_HOLE_RADIUS = 375
 const POINTER_HOLE_STRENGTH = 0.02
 const BLACK_HOLE_POLARITY = 1
 const WHITE_HOLE_POLARITY = -1
+const PARTICLE_OPACITIES = Array.from(
+  { length: 8 },
+  (_, index) => 0.25 + (0.75 * index) / 7,
+)
 const RAINBOW_COLORS = Array.from(
   { length: 36 },
   (_, index) => `hsl(${index * 10}, 100%, 62%)`,
+)
+const PARTICLE_CORE_COLORS = Array.from(
+  { length: RAINBOW_COLORS.length * PARTICLE_OPACITIES.length },
+  (_, bucketIndex) => {
+    const colorIndex = Math.floor(
+      bucketIndex / PARTICLE_OPACITIES.length,
+    )
+    const brightnessIndex = bucketIndex % PARTICLE_OPACITIES.length
+    const lightness = 25 + (37 * brightnessIndex) / 7
+
+    return `hsl(${colorIndex * 10}, 100%, ${lightness}%)`
+  },
 )
 
 document.querySelector('#app').innerHTML = `
@@ -57,7 +74,7 @@ engine.constraintIterations = 1
 
 const particles = []
 const liveColorBuckets = Array.from(
-  { length: RAINBOW_COLORS.length },
+  { length: RAINBOW_COLORS.length * PARTICLE_OPACITIES.length },
   () => [],
 )
 const retiringParticles = Array.from(
@@ -94,6 +111,12 @@ const clamp = (value, minimum, maximum) =>
 
 const randomBetween = (minimum, maximum) =>
   minimum + Math.random() * (maximum - minimum)
+
+const getParticleOpacityIndex = (speed) =>
+  Math.round(
+    Math.sqrt(clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1)) *
+      (PARTICLE_OPACITIES.length - 1),
+  )
 
 const getAirResistance = () =>
   MAX_AIR_RESISTANCE * (airResistancePercent / MAX_CONTROL_PERCENT)
@@ -368,6 +391,8 @@ function retireParticle(particle, startedAt) {
   retiringParticle.velocityX = body.velocity.x
   retiringParticle.velocityY = body.velocity.y
   retiringParticle.colorIndex = particle.colorIndex
+  retiringParticle.opacity =
+    PARTICLE_OPACITIES[getParticleOpacityIndex(body.speed)]
   retiringParticle.radius = particle.radius
   retiringParticle.startedAt = startedAt
 }
@@ -692,7 +717,7 @@ function drawFrame(time) {
     context.beginPath()
     context.moveTo(previousX, previousY)
     context.lineTo(particle.x, particle.y)
-    context.globalAlpha = (1 - fadeProgress) ** 2
+    context.globalAlpha = particle.opacity * (1 - fadeProgress) ** 2
     context.lineWidth = 1
     context.strokeStyle = RAINBOW_COLORS[particle.colorIndex]
     context.stroke()
@@ -703,15 +728,24 @@ function drawFrame(time) {
   const interpolation = physicsAccumulator / FRAME_DURATION
 
   for (const particle of particles) {
-    liveColorBuckets[particle.colorIndex].push(particle)
+    const opacityIndex = getParticleOpacityIndex(particle.body.speed)
+    const bucketIndex =
+      particle.colorIndex * PARTICLE_OPACITIES.length + opacityIndex
+
+    liveColorBuckets[bucketIndex].push(particle)
   }
 
-  for (let colorIndex = 0; colorIndex < liveColorBuckets.length; colorIndex += 1) {
-    const bucket = liveColorBuckets[colorIndex]
+  for (let bucketIndex = 0; bucketIndex < liveColorBuckets.length; bucketIndex += 1) {
+    const bucket = liveColorBuckets[bucketIndex]
 
     if (bucket.length === 0) {
       continue
     }
+
+    const colorIndex = Math.floor(
+      bucketIndex / PARTICLE_OPACITIES.length,
+    )
+    const opacityIndex = bucketIndex % PARTICLE_OPACITIES.length
 
     context.beginPath()
 
@@ -729,13 +763,41 @@ function drawFrame(time) {
       particle.renderY = y
     }
 
+    context.globalAlpha = PARTICLE_OPACITIES[opacityIndex]
     context.strokeStyle = RAINBOW_COLORS[colorIndex]
     context.stroke()
-    bucket.length = 0
   }
 
   context.globalAlpha = 1
   context.globalCompositeOperation = 'source-over'
+
+  for (let bucketIndex = 0; bucketIndex < liveColorBuckets.length; bucketIndex += 1) {
+    const bucket = liveColorBuckets[bucketIndex]
+
+    if (bucket.length === 0) {
+      continue
+    }
+
+    context.beginPath()
+
+    for (const particle of bucket) {
+      const radius = Math.max(0.5, particle.radius)
+
+      context.moveTo(particle.renderX + radius, particle.renderY)
+      context.arc(
+        particle.renderX,
+        particle.renderY,
+        radius,
+        0,
+        Math.PI * 2,
+      )
+    }
+
+    context.fillStyle = PARTICLE_CORE_COLORS[bucketIndex]
+    context.fill()
+    bucket.length = 0
+  }
+
   requestAnimationFrame(drawFrame)
 }
 
