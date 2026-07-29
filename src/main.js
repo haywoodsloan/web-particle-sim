@@ -11,6 +11,11 @@ const MAX_PARTICLES_PER_FRAME = 10
 const RETIRE_FADE_DURATION = 500
 const MAX_RETIRING_PARTICLES = 180
 const FRAME_DURATION = 1000 / 60
+const SIMPLIFY_FRAME_DURATION = 1000 / 45
+const RESTORE_FRAME_DURATION = 1000 / 55
+const SIMPLIFY_AFTER_DURATION = 600
+const RESTORE_AFTER_DURATION = 2000
+const FRAME_DURATION_SMOOTHING = 0.08
 const CONTROL_STEP = 10
 const MAX_CONTROL_PERCENT = 100
 const PARTICLE_GRAVITY = 4e-8
@@ -27,6 +32,7 @@ const PARTICLE_GLOW_INTENSITIES = Array.from(
   { length: 8 },
   (_, index) => 0.15 + (1.2 * index) / 7,
 )
+const SIMPLIFIED_BRIGHTNESS_INDICES = [0, 0, 2, 2, 4, 4, 7, 7]
 const RAINBOW_COLORS = Array.from(
   { length: 36 },
   (_, index) => `hsl(${index * 10}, 100%, 62%)`,
@@ -98,9 +104,14 @@ let viewportHeight = window.innerHeight
 let pixelRatio = 1
 let previousFrameTime = performance.now()
 let physicsAccumulator = 0
+let smoothedFrameDuration = FRAME_DURATION
+let simplifyPressureDuration = 0
+let restorePressureDuration = 0
+let renderFrameIndex = 0
 let gravityPercent = 0
 let airResistancePercent = 0
 let isParticleEmissionEnabled = true
+let isSimplifiedRendering = false
 let particleLimit = DEFAULT_PARTICLE_LIMIT
 
 const pointer = {
@@ -124,13 +135,115 @@ const getParticleOpacityIndex = (speed) =>
       (PARTICLE_GLOW_INTENSITIES.length - 1),
   )
 
-function strokeWithGlowIntensity(intensity) {
+function getParticleRenderBucketIndex(particle) {
+  let brightnessIndex = getParticleOpacityIndex(particle.body.speed)
+
+  if (isSimplifiedRendering) {
+    brightnessIndex = SIMPLIFIED_BRIGHTNESS_INDICES[brightnessIndex]
+  }
+
+  return (
+    particle.colorIndex * PARTICLE_GLOW_INTENSITIES.length +
+    brightnessIndex
+  )
+}
+
+function strokeWithGlowIntensity(intensity, allowExtraPass = true) {
   context.globalAlpha = Math.min(intensity, 1)
   context.stroke()
 
-  if (intensity > 1) {
+  if (allowExtraPass && intensity > 1) {
     context.globalAlpha = intensity - 1
     context.stroke()
+  }
+}
+
+const getTargetPixelRatio = () =>
+  Math.min(window.devicePixelRatio || 1, isSimplifiedRendering ? 1 : 2)
+
+function configureCanvas() {
+  pixelRatio = getTargetPixelRatio()
+  canvas.width = Math.round(viewportWidth * pixelRatio)
+  canvas.height = Math.round(viewportHeight * pixelRatio)
+  canvas.style.width = `${viewportWidth}px`
+  canvas.style.height = `${viewportHeight}px`
+
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
+  context.globalCompositeOperation = 'source-over'
+  context.globalAlpha = 1
+  context.fillStyle = '#000000'
+  context.fillRect(0, 0, viewportWidth, viewportHeight)
+  context.fillStyle = 'rgba(0, 0, 0, 0.24)'
+  context.lineCap = 'round'
+}
+
+function setSimplifiedRendering(shouldSimplify) {
+  if (isSimplifiedRendering === shouldSimplify) {
+    return
+  }
+
+  const previousPixelRatio = pixelRatio
+
+  isSimplifiedRendering = shouldSimplify
+  canvas.dataset.renderQuality = shouldSimplify ? 'simplified' : 'full'
+
+  for (const particle of particles) {
+    particle.renderBucketIndex = getParticleRenderBucketIndex(particle)
+  }
+
+  if (getTargetPixelRatio() !== previousPixelRatio) {
+    configureCanvas()
+  }
+}
+
+function resetAdaptiveRenderingMonitor() {
+  smoothedFrameDuration = FRAME_DURATION
+  simplifyPressureDuration = 0
+  restorePressureDuration = 0
+}
+
+function updateAdaptiveRendering(frameDuration) {
+  if (document.hidden || frameDuration <= 0) {
+    return
+  }
+
+  const boundedFrameDuration = Math.min(frameDuration, 100)
+
+  smoothedFrameDuration +=
+    (boundedFrameDuration - smoothedFrameDuration) *
+    FRAME_DURATION_SMOOTHING
+
+  if (isSimplifiedRendering) {
+    simplifyPressureDuration = 0
+
+    if (smoothedFrameDuration < RESTORE_FRAME_DURATION) {
+      restorePressureDuration += boundedFrameDuration
+    } else {
+      restorePressureDuration = 0
+    }
+
+    if (restorePressureDuration >= RESTORE_AFTER_DURATION) {
+      setSimplifiedRendering(false)
+      resetAdaptiveRenderingMonitor()
+    }
+
+    return
+  }
+
+  restorePressureDuration = 0
+
+  if (smoothedFrameDuration > SIMPLIFY_FRAME_DURATION) {
+    simplifyPressureDuration += boundedFrameDuration
+  } else {
+    simplifyPressureDuration = Math.max(
+      0,
+      simplifyPressureDuration - boundedFrameDuration * 2,
+    )
+  }
+
+  if (simplifyPressureDuration >= SIMPLIFY_AFTER_DURATION) {
+    setSimplifiedRendering(true)
+    resetAdaptiveRenderingMonitor()
   }
 }
 
@@ -383,18 +496,10 @@ function preserveElasticWallImpacts() {
 function resizeCanvas() {
   viewportWidth = window.innerWidth
   viewportHeight = window.innerHeight
-  pixelRatio = Math.min(window.devicePixelRatio || 1, 2)
-
-  canvas.width = Math.round(viewportWidth * pixelRatio)
-  canvas.height = Math.round(viewportHeight * pixelRatio)
-  canvas.style.width = `${viewportWidth}px`
-  canvas.style.height = `${viewportHeight}px`
-
-  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
-  context.fillStyle = '#000000'
-  context.fillRect(0, 0, viewportWidth, viewportHeight)
-  context.fillStyle = 'rgba(0, 0, 0, 0.24)'
-  context.lineCap = 'round'
+  canvas.dataset.renderQuality = isSimplifiedRendering
+    ? 'simplified'
+    : 'full'
+  configureCanvas()
   rebuildBoundaries()
 }
 
@@ -466,9 +571,7 @@ function createParticle(x, y, heading, pointerSpeed, hue, emittedAt) {
   })
 
   particle.colorIndex = Math.floor(hue / 10) % RAINBOW_COLORS.length
-  particle.renderBucketIndex =
-    particle.colorIndex * PARTICLE_GLOW_INTENSITIES.length +
-    getParticleOpacityIndex(particle.body.speed)
+  particle.renderBucketIndex = getParticleRenderBucketIndex(particle)
   particle.radius = radius
   particle.previousX = position.x
   particle.previousY = position.y
@@ -669,10 +772,15 @@ function drawFrame(time) {
     hasPendingPointerSample = false
   }
 
-  const delta = Math.min(time - previousFrameTime, FRAME_DURATION)
+  const rawFrameDuration = time - previousFrameTime
+  const delta = Math.min(rawFrameDuration, FRAME_DURATION)
   previousFrameTime = time
+  updateAdaptiveRendering(rawFrameDuration)
   physicsAccumulator += delta
   let didUpdatePhysics = false
+  const simplifiedRenderPhase = renderFrameIndex % 2
+
+  renderFrameIndex += 1
 
   if (physicsAccumulator + 0.1 >= FRAME_DURATION) {
     for (const particle of particles) {
@@ -698,7 +806,9 @@ function drawFrame(time) {
     engine.gravity.y * engine.gravity.scale * FRAME_DURATION ** 2
   const pointerHoleVelocityScale = FRAME_DURATION ** 2 * frameScale
 
-  for (const particle of retiringParticles) {
+  for (let index = 0; index < retiringParticles.length; index += 1) {
+    const particle = retiringParticles[index]
+
     if (!particle.active) {
       continue
     }
@@ -738,12 +848,20 @@ function drawFrame(time) {
     particle.velocityX *= retirementDrag
     particle.velocityY *= retirementDrag
 
+    if (
+      isSimplifiedRendering &&
+      index % 2 !== simplifiedRenderPhase
+    ) {
+      continue
+    }
+
     context.beginPath()
     context.moveTo(previousX, previousY)
     context.lineTo(particle.x, particle.y)
     context.strokeStyle = RAINBOW_COLORS[particle.colorIndex]
     strokeWithGlowIntensity(
       particle.glowIntensity * (1 - fadeProgress) ** 2,
+      !isSimplifiedRendering,
     )
   }
 
@@ -752,9 +870,7 @@ function drawFrame(time) {
 
   for (const particle of particles) {
     if (didUpdatePhysics) {
-      particle.renderBucketIndex =
-        particle.colorIndex * PARTICLE_GLOW_INTENSITIES.length +
-        getParticleOpacityIndex(particle.body.speed)
+      particle.renderBucketIndex = getParticleRenderBucketIndex(particle)
     }
 
     liveColorBuckets[particle.renderBucketIndex].push(particle)
@@ -771,6 +887,7 @@ function drawFrame(time) {
       bucketIndex / PARTICLE_GLOW_INTENSITIES.length,
     )
     const opacityIndex = bucketIndex % PARTICLE_GLOW_INTENSITIES.length
+    let hasGlowSegments = false
 
     context.beginPath()
 
@@ -782,14 +899,26 @@ function drawFrame(time) {
         particle.previousY +
         (particle.body.position.y - particle.previousY) * interpolation
 
-      context.moveTo(particle.renderX, particle.renderY)
-      context.lineTo(x, y)
+      if (
+        !isSimplifiedRendering ||
+        particle.body.id % 2 === simplifiedRenderPhase
+      ) {
+        context.moveTo(particle.renderX, particle.renderY)
+        context.lineTo(x, y)
+        hasGlowSegments = true
+      }
+
       particle.renderX = x
       particle.renderY = y
     }
 
-    context.strokeStyle = RAINBOW_COLORS[colorIndex]
-    strokeWithGlowIntensity(PARTICLE_GLOW_INTENSITIES[opacityIndex])
+    if (hasGlowSegments) {
+      context.strokeStyle = RAINBOW_COLORS[colorIndex]
+      strokeWithGlowIntensity(
+        PARTICLE_GLOW_INTENSITIES[opacityIndex],
+        !isSimplifiedRendering,
+      )
+    }
   }
 
   context.globalAlpha = 1
@@ -846,6 +975,7 @@ window.addEventListener('blur', () => resetPointer())
 document.addEventListener('visibilitychange', () => {
   previousFrameTime = performance.now()
   physicsAccumulator = 0
+  resetAdaptiveRenderingMonitor()
 
   for (const particle of particles) {
     particle.previousX = particle.body.position.x
