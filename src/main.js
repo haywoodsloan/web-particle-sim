@@ -18,25 +18,26 @@ const MAX_WORLD_GRAVITY = 1
 const MAX_AIR_RESISTANCE = 0.03
 const EMISSION_VELOCITY_SCALE = 0.72
 const FULL_BRIGHTNESS_SPEED = 10
+const PARTICLE_CORE_DIAMETER = 1.35
 const POINTER_HOLE_RADIUS = 375
 const POINTER_HOLE_STRENGTH = 0.02
 const BLACK_HOLE_POLARITY = 1
 const WHITE_HOLE_POLARITY = -1
-const PARTICLE_OPACITIES = Array.from(
+const PARTICLE_GLOW_INTENSITIES = Array.from(
   { length: 8 },
-  (_, index) => 0.25 + (0.75 * index) / 7,
+  (_, index) => 0.15 + (1.2 * index) / 7,
 )
 const RAINBOW_COLORS = Array.from(
   { length: 36 },
   (_, index) => `hsl(${index * 10}, 100%, 62%)`,
 )
 const PARTICLE_CORE_COLORS = Array.from(
-  { length: RAINBOW_COLORS.length * PARTICLE_OPACITIES.length },
+  { length: RAINBOW_COLORS.length * PARTICLE_GLOW_INTENSITIES.length },
   (_, bucketIndex) => {
     const colorIndex = Math.floor(
-      bucketIndex / PARTICLE_OPACITIES.length,
+      bucketIndex / PARTICLE_GLOW_INTENSITIES.length,
     )
-    const brightnessIndex = bucketIndex % PARTICLE_OPACITIES.length
+    const brightnessIndex = bucketIndex % PARTICLE_GLOW_INTENSITIES.length
     const lightness = 25 + (37 * brightnessIndex) / 7
 
     return `hsl(${colorIndex * 10}, 100%, ${lightness}%)`
@@ -70,11 +71,11 @@ engine.gravity.y = 0
 engine.gravity.scale = 0.001
 engine.positionIterations = 8
 engine.velocityIterations = 2
-engine.constraintIterations = 1
+engine.constraintIterations = 0
 
 const particles = []
 const liveColorBuckets = Array.from(
-  { length: RAINBOW_COLORS.length * PARTICLE_OPACITIES.length },
+  { length: RAINBOW_COLORS.length * PARTICLE_GLOW_INTENSITIES.length },
   () => [],
 )
 const retiringParticles = Array.from(
@@ -86,7 +87,12 @@ const pendingWallImpacts = new Map()
 let boundaries = []
 let recycleCursor = 0
 let retiringCursor = 0
-let pendingPointerSample = null
+const pendingPointerSample = {
+  clientX: 0,
+  clientY: 0,
+  timeStamp: 0,
+}
+let hasPendingPointerSample = false
 let viewportWidth = window.innerWidth
 let viewportHeight = window.innerHeight
 let pixelRatio = 1
@@ -115,8 +121,18 @@ const randomBetween = (minimum, maximum) =>
 const getParticleOpacityIndex = (speed) =>
   Math.round(
     Math.sqrt(clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1)) *
-      (PARTICLE_OPACITIES.length - 1),
+      (PARTICLE_GLOW_INTENSITIES.length - 1),
   )
+
+function strokeWithGlowIntensity(intensity) {
+  context.globalAlpha = Math.min(intensity, 1)
+  context.stroke()
+
+  if (intensity > 1) {
+    context.globalAlpha = intensity - 1
+    context.stroke()
+  }
+}
 
 const getAirResistance = () =>
   MAX_AIR_RESISTANCE * (airResistancePercent / MAX_CONTROL_PERCENT)
@@ -130,7 +146,7 @@ function showControlStatus(message) {
 
 function toggleParticleEmission() {
   isParticleEmissionEnabled = !isParticleEmissionEnabled
-  pendingPointerSample = null
+  hasPendingPointerSample = false
   pointer.spawnBudget = 0
   canvas.classList.toggle(
     'is-emission-disabled',
@@ -377,6 +393,8 @@ function resizeCanvas() {
   context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
   context.fillStyle = '#000000'
   context.fillRect(0, 0, viewportWidth, viewportHeight)
+  context.fillStyle = 'rgba(0, 0, 0, 0.24)'
+  context.lineCap = 'round'
   rebuildBoundaries()
 }
 
@@ -391,8 +409,8 @@ function retireParticle(particle, startedAt) {
   retiringParticle.velocityX = body.velocity.x
   retiringParticle.velocityY = body.velocity.y
   retiringParticle.colorIndex = particle.colorIndex
-  retiringParticle.opacity =
-    PARTICLE_OPACITIES[getParticleOpacityIndex(body.speed)]
+  retiringParticle.glowIntensity =
+    PARTICLE_GLOW_INTENSITIES[getParticleOpacityIndex(body.speed)]
   retiringParticle.radius = particle.radius
   retiringParticle.startedAt = startedAt
 }
@@ -448,6 +466,9 @@ function createParticle(x, y, heading, pointerSpeed, hue, emittedAt) {
   })
 
   particle.colorIndex = Math.floor(hue / 10) % RAINBOW_COLORS.length
+  particle.renderBucketIndex =
+    particle.colorIndex * PARTICLE_GLOW_INTENSITIES.length +
+    getParticleOpacityIndex(particle.body.speed)
   particle.radius = radius
   particle.previousX = position.x
   particle.previousY = position.y
@@ -515,6 +536,10 @@ function applyPointerHoleForce() {
     const deltaY = pointer.y - body.position.y
     const accelerationScale = getPointerHoleAccelerationScale(deltaX, deltaY)
 
+    if (accelerationScale === 0) {
+      continue
+    }
+
     body.force.x += deltaX * body.mass * accelerationScale
     body.force.y += deltaY * body.mass * accelerationScale
   }
@@ -578,7 +603,7 @@ function handlePointerMove(event) {
   const sample = samples[samples.length - 1] ?? event
 
   if (!isParticleEmissionEnabled || pointer.holePolarity !== 0) {
-    pendingPointerSample = null
+    hasPendingPointerSample = false
     pointer.x = sample.clientX
     pointer.y = sample.clientY
     pointer.time = sample.timeStamp
@@ -586,11 +611,10 @@ function handlePointerMove(event) {
     return
   }
 
-  pendingPointerSample = {
-    clientX: sample.clientX,
-    clientY: sample.clientY,
-    timeStamp: sample.timeStamp,
-  }
+  pendingPointerSample.clientX = sample.clientX
+  pendingPointerSample.clientY = sample.clientY
+  pendingPointerSample.timeStamp = sample.timeStamp
+  hasPendingPointerSample = true
 }
 
 function updatePointerHole(event) {
@@ -630,7 +654,7 @@ function updatePointerHoleIndicator(x = pointer.x, y = pointer.y) {
 }
 
 function resetPointer(event) {
-  pendingPointerSample = null
+  hasPendingPointerSample = false
   pointer.x = event?.clientX ?? null
   pointer.y = event?.clientY ?? null
   pointer.time = event?.timeStamp ?? null
@@ -640,14 +664,15 @@ function resetPointer(event) {
 }
 
 function drawFrame(time) {
-  if (pendingPointerSample) {
+  if (hasPendingPointerSample) {
     emitFromPointer(pendingPointerSample, time)
-    pendingPointerSample = null
+    hasPendingPointerSample = false
   }
 
   const delta = Math.min(time - previousFrameTime, FRAME_DURATION)
   previousFrameTime = time
   physicsAccumulator += delta
+  let didUpdatePhysics = false
 
   if (physicsAccumulator + 0.1 >= FRAME_DURATION) {
     for (const particle of particles) {
@@ -659,15 +684,14 @@ function drawFrame(time) {
     applyPointerHoleForce()
     Engine.update(engine, FRAME_DURATION)
     physicsAccumulator = Math.max(0, physicsAccumulator - FRAME_DURATION)
+    didUpdatePhysics = true
   }
 
-  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
   context.globalCompositeOperation = 'source-over'
   context.globalAlpha = 1
-  context.fillStyle = 'rgba(0, 0, 0, 0.24)'
   context.fillRect(0, 0, viewportWidth, viewportHeight)
   context.globalCompositeOperation = 'lighter'
-  context.lineCap = 'round'
+  context.lineWidth = 1
   const frameScale = delta / FRAME_DURATION
   const retirementDrag = (1 - getAirResistance()) ** frameScale
   const retirementGravity =
@@ -717,22 +741,23 @@ function drawFrame(time) {
     context.beginPath()
     context.moveTo(previousX, previousY)
     context.lineTo(particle.x, particle.y)
-    context.globalAlpha = particle.opacity * (1 - fadeProgress) ** 2
-    context.lineWidth = 1
     context.strokeStyle = RAINBOW_COLORS[particle.colorIndex]
-    context.stroke()
+    strokeWithGlowIntensity(
+      particle.glowIntensity * (1 - fadeProgress) ** 2,
+    )
   }
 
   context.globalAlpha = 1
-  context.lineWidth = 1
   const interpolation = physicsAccumulator / FRAME_DURATION
 
   for (const particle of particles) {
-    const opacityIndex = getParticleOpacityIndex(particle.body.speed)
-    const bucketIndex =
-      particle.colorIndex * PARTICLE_OPACITIES.length + opacityIndex
+    if (didUpdatePhysics) {
+      particle.renderBucketIndex =
+        particle.colorIndex * PARTICLE_GLOW_INTENSITIES.length +
+        getParticleOpacityIndex(particle.body.speed)
+    }
 
-    liveColorBuckets[bucketIndex].push(particle)
+    liveColorBuckets[particle.renderBucketIndex].push(particle)
   }
 
   for (let bucketIndex = 0; bucketIndex < liveColorBuckets.length; bucketIndex += 1) {
@@ -743,9 +768,9 @@ function drawFrame(time) {
     }
 
     const colorIndex = Math.floor(
-      bucketIndex / PARTICLE_OPACITIES.length,
+      bucketIndex / PARTICLE_GLOW_INTENSITIES.length,
     )
-    const opacityIndex = bucketIndex % PARTICLE_OPACITIES.length
+    const opacityIndex = bucketIndex % PARTICLE_GLOW_INTENSITIES.length
 
     context.beginPath()
 
@@ -763,13 +788,13 @@ function drawFrame(time) {
       particle.renderY = y
     }
 
-    context.globalAlpha = PARTICLE_OPACITIES[opacityIndex]
     context.strokeStyle = RAINBOW_COLORS[colorIndex]
-    context.stroke()
+    strokeWithGlowIntensity(PARTICLE_GLOW_INTENSITIES[opacityIndex])
   }
 
   context.globalAlpha = 1
   context.globalCompositeOperation = 'source-over'
+  context.lineWidth = PARTICLE_CORE_DIAMETER
 
   for (let bucketIndex = 0; bucketIndex < liveColorBuckets.length; bucketIndex += 1) {
     const bucket = liveColorBuckets[bucketIndex]
@@ -781,20 +806,12 @@ function drawFrame(time) {
     context.beginPath()
 
     for (const particle of bucket) {
-      const radius = Math.max(0.5, particle.radius)
-
-      context.moveTo(particle.renderX + radius, particle.renderY)
-      context.arc(
-        particle.renderX,
-        particle.renderY,
-        radius,
-        0,
-        Math.PI * 2,
-      )
+      context.moveTo(particle.renderX, particle.renderY)
+      context.lineTo(particle.renderX + 0.01, particle.renderY)
     }
 
-    context.fillStyle = PARTICLE_CORE_COLORS[bucketIndex]
-    context.fill()
+    context.strokeStyle = PARTICLE_CORE_COLORS[bucketIndex]
+    context.stroke()
     bucket.length = 0
   }
 
