@@ -551,6 +551,25 @@ impl World {
             self.tree_packed[base + 2] = mass as f32;
             self.tree_packed[base + 3] = self.tree_size[node] as f32;
 
+            // Children are already final, so the empties can be squeezed out
+            // now rather than rediscovered on every traversal.
+            if self.tree_children[base] != -1 {
+                let mut kept = 0;
+
+                for quadrant in 0..4 {
+                    let child = self.tree_children[base + quadrant];
+
+                    if child >= 0 && self.tree_packed[child as usize * 4 + 2] > 0.0 {
+                        self.tree_children[base + kept] = child;
+                        kept += 1;
+                    }
+                }
+
+                if kept < 4 {
+                    self.tree_children[base + kept] = -1;
+                }
+            }
+
             let parent = self.tree_parent[node];
 
             if parent >= 0 {
@@ -633,7 +652,13 @@ impl World {
             }
 
             for quadrant in 0..4 {
-                self.tree_stack[top] = self.tree_children[base + quadrant];
+                let child = self.tree_children[base + quadrant];
+
+                if child < 0 {
+                    break;
+                }
+
+                self.tree_stack[top] = child;
                 top += 1;
             }
         }
