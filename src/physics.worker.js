@@ -79,8 +79,8 @@ let hasDiscontinuity = true
 
 let px = new Float32Array(0)
 let py = new Float32Array(0)
-let previousPx = new Float32Array(0)
-let previousPy = new Float32Array(0)
+let vx = new Float32Array(0)
+let vy = new Float32Array(0)
 let mass = new Float32Array(0)
 let colorIndex = new Uint8Array(0)
 let respawned = new Uint8Array(0)
@@ -123,8 +123,8 @@ function ensureCapacity(required) {
 
   px = copy(px)
   py = copy(py)
-  previousPx = copy(previousPx)
-  previousPy = copy(previousPy)
+  vx = copy(vx)
+  vy = copy(vy)
   mass = copy(mass)
   colorIndex = copy(colorIndex)
   respawned = copy(respawned)
@@ -177,10 +177,10 @@ function recordRetirement(index) {
   pendingRetirements.push({
     x: px[index],
     y: py[index],
-    velocityX: px[index] - previousPx[index],
-    velocityY: py[index] - previousPy[index],
+    velocityX: vx[index],
+    velocityY: vy[index],
     colorIndex: colorIndex[index],
-    speed: Math.hypot(px[index] - previousPx[index], py[index] - previousPy[index]),
+    speed: Math.hypot(vx[index], vy[index]),
   })
 }
 
@@ -265,9 +265,8 @@ function spawnParticle(x, y, heading, pointerSpeed, hue) {
 
   px[index] = positionX
   py[index] = positionY
-  // A recycled particle must not streak in from wherever it used to be.
-  previousPx[index] = positionX
-  previousPy[index] = positionY
+  vx[index] = velocity.x / STEPS_PER_SECOND
+  vy[index] = velocity.y / STEPS_PER_SECOND
   colorIndex[index] = Math.floor(hue / 10) % HUE_COUNT
   respawned[index] = 1
 }
@@ -387,12 +386,16 @@ function applyFieldImpulses() {
 
 function readBackState() {
   for (let index = 0; index < bodies.length; index += 1) {
-    const translation = bodies[index].translation()
+    const body = bodies[index]
+    const translation = body.translation()
+    // Displacement matches this for ~99% of particles, but soft-contact
+    // position correction throws it off by up to 48x for bodies in contact.
+    const velocity = body.linvel()
 
-    previousPx[index] = px[index]
-    previousPy[index] = py[index]
     px[index] = translation.x
     py[index] = translation.y
+    vx[index] = velocity.x / STEPS_PER_SECOND
+    vy[index] = velocity.y / STEPS_PER_SECOND
   }
 }
 
@@ -431,11 +434,7 @@ function sendSnapshot() {
   for (let index = 0; index < count; index += 1) {
     views.positions[index * 2] = px[index]
     views.positions[index * 2 + 1] = py[index]
-    // Displacement over one step IS the velocity in px/step.
-    views.speeds[index] = Math.hypot(
-      px[index] - previousPx[index],
-      py[index] - previousPy[index],
-    )
+    views.speeds[index] = Math.hypot(vx[index], vy[index])
     views.colors[index] = colorIndex[index]
     views.flags[index] = respawned[index] ? PARTICLE_FLAG_RESPAWNED : 0
     respawned[index] = 0
