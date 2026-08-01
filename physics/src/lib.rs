@@ -46,7 +46,8 @@ const MAX_TREE_DEPTH: u32 = 20;
 const SPAWN_JITTER: f32 = 2.5;
 const SPAWN_PLACEMENT_ATTEMPTS: usize = 8;
 /// A replaced particle keeps colliding while it dims out over these frames.
-const RETIRE_FADE_FRAMES: f32 = 9.0;
+/// The step rate is fixed, so this is 225 ms on any display.
+const RETIRE_FADE_FRAMES: f32 = 13.5;
 const RETIRE_FADE_LEVELS: f32 = 7.0;
 /// Past this backlog the longest-running fades are cut short.
 const MAX_RETIRING: usize = 250;
