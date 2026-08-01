@@ -9,9 +9,11 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    "vite": "^8.1.1"
+    "vite": "^8.1.1",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0"
   },
   "dependencies": {
-    "matter-js": "^0.20.0"
+    "@dimforge/rapier2d": "^0.19.3"
   }
 }
