@@ -63,7 +63,10 @@ document.querySelector('#app').innerHTML = `
   </canvas>
   <div id="pointer-hole" aria-hidden="true"></div>
   <div id="particle-count" aria-hidden="true"></div>
-  <div id="frame-rate" aria-hidden="true"></div>
+  <div id="rate-stats" aria-hidden="true">
+    <span id="frame-rate"></span>
+    <span id="tick-rate"></span>
+  </div>
   <div
     id="control-status"
     role="status"
@@ -88,7 +91,9 @@ document.querySelector('#app').innerHTML = `
 const canvas = document.querySelector('#particle-canvas')
 const pointerHole = document.querySelector('#pointer-hole')
 const particleCount = document.querySelector('#particle-count')
+const rateStats = document.querySelector('#rate-stats')
 const frameRate = document.querySelector('#frame-rate')
+const tickRate = document.querySelector('#tick-rate')
 const controlStatus = document.querySelector('#control-status')
 const controlsDialog = document.querySelector('#controls-dialog')
 const context = createRenderer(canvas, PARTICLE_RADIUS)
@@ -112,6 +117,7 @@ let airResistancePercent = 0
 let isParticleEmissionEnabled = true
 let areStatsVisible = false
 let statsFrames = 0
+let statsSteps = 0
 let statsSince = 0
 let particleLimit = DEFAULT_PARTICLE_LIMIT
 
@@ -198,8 +204,9 @@ function adjustParticleLimit(direction) {
 function toggleStats() {
   areStatsVisible = !areStatsVisible
   particleCount.classList.toggle('is-visible', areStatsVisible)
-  frameRate.classList.toggle('is-visible', areStatsVisible)
+  rateStats.classList.toggle('is-visible', areStatsVisible)
   statsFrames = 0
+  statsSteps = latestSnapshot?.views.header[2] ?? 0
   statsSince = performance.now()
 }
 
@@ -460,9 +467,16 @@ function drawFrame(time) {
     const elapsed = time - statsSince
 
     if (elapsed >= STATS_INTERVAL) {
+      // The engine counts every step it runs, including ones whose snapshot was
+      // dropped, so this is the physics rate rather than the delivery rate.
+      const steps = latestSnapshot?.views.header[2] ?? 0
+      const ticks = (steps - statsSteps) >>> 0
+
       particleCount.textContent = `${latestSnapshot?.count ?? 0}`
       frameRate.textContent = `${Math.round((statsFrames * 1000) / elapsed)} fps`
+      tickRate.textContent = `${Math.round((ticks * 1000) / elapsed)} tps`
       statsFrames = 0
+      statsSteps = steps
       statsSince = time
     }
   }

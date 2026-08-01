@@ -31,8 +31,13 @@ const PARTICLE_FADE_SHIFT: u8 = 1;
 
 /// Tuning is expressed in px/ms^2 but the solver integrates in frames.
 const ACCELERATION_TO_FRAMES: f32 = FRAME_DURATION * FRAME_DURATION;
-const PHYSICS_SUBSTEPS: usize = 8;
-const SUBSTEP_DT: f32 = 1.0 / PHYSICS_SUBSTEPS as f32;
+const MIN_PHYSICS_SUBSTEPS: usize = 8;
+const MAX_PHYSICS_SUBSTEPS: usize = 32;
+/// Headroom for the speed a particle gains during the frame it is measured on.
+const SUBSTEP_SPEED_MARGIN: f32 = 1.25;
+/// Passes over the contact set per substep. Beyond the first the velocity swap
+/// has already separated every pair, so the rest only relax residual overlap.
+const CONTACT_ITERATIONS: usize = 2;
 const CONTACT_DIAMETER: f32 = PARTICLE_RADIUS * 2.0;
 const CONTACT_DIAMETER_SQUARED: f32 = CONTACT_DIAMETER * CONTACT_DIAMETER;
 const INVERSE_CELL_SIZE: f32 = 1.0 / CONTACT_DIAMETER;
@@ -358,8 +363,16 @@ impl World {
     }
 
     fn solve_contacts(&mut self) {
+        // One grid serves every pass: a correction moves a particle far less
+        // than the cell size, so its neighbourhood cannot change underneath it.
         self.build_grid();
 
+        for _ in 0..CONTACT_ITERATIONS {
+            self.relax_contacts();
+        }
+    }
+
+    fn relax_contacts(&mut self) {
         for index in 0..self.count {
             let cell_x = (self.x[index] * INVERSE_CELL_SIZE).floor() as i32;
             let cell_y = (self.y[index] * INVERSE_CELL_SIZE).floor() as i32;
@@ -936,15 +949,35 @@ impl World {
 
     // ---- stepping ----------------------------------------------------------
 
-    fn integrate(&mut self, retained: f32) {
+    fn integrate(&mut self, retained: f32, dt: f32) {
         for index in 0..self.count {
             self.velocity_x[index] =
-                (self.velocity_x[index] + self.acceleration_x[index] * SUBSTEP_DT) * retained;
+                (self.velocity_x[index] + self.acceleration_x[index] * dt) * retained;
             self.velocity_y[index] =
-                (self.velocity_y[index] + self.acceleration_y[index] * SUBSTEP_DT) * retained;
-            self.x[index] += self.velocity_x[index] * SUBSTEP_DT;
-            self.y[index] += self.velocity_y[index] * SUBSTEP_DT;
+                (self.velocity_y[index] + self.acceleration_y[index] * dt) * retained;
+            self.x[index] += self.velocity_x[index] * dt;
+            self.y[index] += self.velocity_y[index] * dt;
         }
+    }
+
+    /// A pair passes straight through each other when either crosses a contact
+    /// diameter inside one substep, so the fastest particle sets the count.
+    fn choose_substeps(&self) -> usize {
+        let mut fastest_squared = 0.0f32;
+
+        for index in 0..self.count {
+            let speed_squared = self.velocity_x[index] * self.velocity_x[index]
+                + self.velocity_y[index] * self.velocity_y[index];
+
+            if speed_squared > fastest_squared {
+                fastest_squared = speed_squared;
+            }
+        }
+
+        let needed = (fastest_squared.sqrt() * SUBSTEP_SPEED_MARGIN / CONTACT_DIAMETER).ceil();
+
+        // Saturating cast, so an infinite speed lands on the ceiling.
+        (needed as usize).clamp(MIN_PHYSICS_SUBSTEPS, MAX_PHYSICS_SUBSTEPS)
     }
 
     fn solve_walls(&mut self) {
@@ -980,13 +1013,15 @@ impl World {
 
     fn step(&mut self) {
         let air_resistance = MAX_AIR_RESISTANCE * (self.air_percent / MAX_CONTROL_PERCENT);
-        let retained = (1.0 - air_resistance).max(0.0).powf(SUBSTEP_DT);
+        let substeps = self.choose_substeps();
+        let dt = 1.0 / substeps as f32;
+        let retained = (1.0 - air_resistance).max(0.0).powf(dt);
 
         // Ahead of the substeps so the last grid built this step still matches
         // the array, which the spawn overlap check relies on until the next one.
         self.expire_fades();
 
-        for substep in 0..PHYSICS_SUBSTEPS {
+        for substep in 0..substeps {
             // Sources barely shift within a frame, so one tree serves the whole
             // step and later substeps replay the sets recorded against it.
             if substep == 0 && self.count > 1 {
@@ -999,7 +1034,7 @@ impl World {
                 self.accumulate_field();
             }
 
-            self.integrate(retained);
+            self.integrate(retained, dt);
             self.solve_contacts();
             self.solve_walls();
         }
