@@ -9,14 +9,24 @@ export const MAX_PARTICLES_PER_FRAME = 10
 export const EMISSION_VELOCITY_SCALE = 0.4
 export const FULL_BRIGHTNESS_SPEED = 6
 export const PARTICLE_GRAVITY = 0.15
-export const PARTICLE_GRAVITY_SOFTENING = 24
+/**
+ * Roughly the contact diameter. Larger values flatten gravity to a harmonic
+ * well at close range, which prevents orbits and bound pairs from forming.
+ */
+export const PARTICLE_GRAVITY_SOFTENING = 4
 export const POINTER_HOLE_RADIUS = 375
 export const POINTER_HOLE_MASS = 288
 export const POINTER_HOLE_SOFTENING = 90
 export const BLACK_HOLE_POLARITY = 1
 export const WHITE_HOLE_POLARITY = -1
-export const HUE_COUNT = 36
-export const PARTICLE_RADIUS = 1.05
+export const HUE_COUNT = 18
+/** Degrees per colour index, so the palette spans the wheel exactly once. */
+export const HUE_STEP = 360 / HUE_COUNT
+/**
+ * Contact diameter must exceed the distance a particle covers in one step, or
+ * discrete detection skips straight past the encounter.
+ */
+export const PARTICLE_RADIUS = 1.8
 
 export const MESSAGE_INIT = 'init'
 export const MESSAGE_RESIZE = 'resize'

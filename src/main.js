@@ -6,6 +6,7 @@ import {
   FRAME_DURATION,
   FULL_BRIGHTNESS_SPEED,
   HUE_COUNT,
+  HUE_STEP,
   MAX_CONTROL_PERCENT,
   MESSAGE_AIR_RESISTANCE,
   MESSAGE_EMISSION,
@@ -21,6 +22,7 @@ import {
   MESSAGE_VISIBILITY,
   PARTICLE_FLAG_RESPAWNED,
   PARTICLE_LIMIT_STEP,
+  PARTICLE_RADIUS,
   SNAPSHOT_FLAG_DISCONTINUOUS,
   WHITE_HOLE_POLARITY,
   clamp,
@@ -29,9 +31,14 @@ import {
 } from './simulation-shared.js'
 
 const CONTROL_STEP = 10
-const PARTICLE_DIAMETER = 1.8
-const BRIGHTNESS_LEVELS = 4
+/** Drawn size tracks the collider, so what you see is what collides. */
+const PARTICLE_DIAMETER = PARTICLE_RADIUS * 2
+const BRIGHTNESS_LEVELS = 8
 const MAX_PIXEL_RATIO = 2
+/** Trail decay constant; keeps the veil independent of frame rate. */
+const TRAIL_TAU = 28
+/** Beyond this a streak is a teleport, not motion. */
+const MAX_STREAK_LENGTH = 160
 const SNAPSHOT_POOL_SIZE = 4
 const SNAPSHOT_INTERVAL_SMOOTHING = 0.15
 const MAX_INTERPOLATION_SPAN = 250
@@ -43,7 +50,7 @@ const PARTICLE_COLORS = Array.from(
     const brightnessIndex = bucketIndex % BRIGHTNESS_LEVELS
     const lightness = 25 + (37 * brightnessIndex) / (BRIGHTNESS_LEVELS - 1)
 
-    return `hsl(${colorIndex * 10}, 100%, ${lightness}%)`
+    return `hsl(${colorIndex * HUE_STEP}, 100%, ${lightness}%)`
   },
 )
 
@@ -67,11 +74,25 @@ document.querySelector('#app').innerHTML = `
     aria-live="polite"
     aria-atomic="true"
   ></div>
+  <dialog id="controls-dialog" aria-labelledby="controls-title">
+    <h1 id="controls-title">Controls</h1>
+    <dl>
+      <dt>Move</dt><dd>Emit particles</dd>
+      <dt>Left click</dt><dd>Black hole</dd>
+      <dt>Right click</dt><dd>White hole</dd>
+      <dt>Space</dt><dd>Toggle emission</dd>
+      <dt>-<span>/</span>=</dt><dd>Gravity</dd>
+      <dt>[<span>/</span>]</dt><dd>Air resistance</dd>
+      <dt>;<span>/</span>'</dt><dd>Particle limit</dd>
+    </dl>
+    <button id="controls-dismiss" type="button" autofocus>OK</button>
+  </dialog>
 `
 
 const canvas = document.querySelector('#particle-canvas')
 const pointerHole = document.querySelector('#pointer-hole')
 const controlStatus = document.querySelector('#control-status')
+const controlsDialog = document.querySelector('#controls-dialog')
 const context = canvas.getContext('2d', { alpha: false })
 const physicsWorker = new Worker(
   new URL('./physics.worker.js', import.meta.url),
@@ -84,7 +105,10 @@ const colorBuckets = Array.from(
 )
 let previousSnapshot = null
 let latestSnapshot = null
+let renderX = new Float32Array(0)
+let renderY = new Float32Array(0)
 let snapshotInterval = FRAME_DURATION
+let previousFrameTime = performance.now()
 let viewportWidth = window.innerWidth
 let viewportHeight = window.innerHeight
 let pixelRatio = 1
@@ -178,6 +202,15 @@ function adjustParticleLimit(direction) {
 }
 
 function handleKeyDown(event) {
+  // The dialog owns the keyboard while it is open.
+  if (controlsDialog.open) {
+    if (event.key === 'Escape') {
+      controlsDialog.close()
+    }
+
+    return
+  }
+
   if (event.ctrlKey || event.altKey || event.metaKey) {
     return
   }
@@ -306,6 +339,20 @@ function resetPointer(event) {
   })
 }
 
+function ensureRenderCapacity(count) {
+  if (renderX.length >= count) {
+    return
+  }
+
+  const grownX = new Float32Array(count)
+  const grownY = new Float32Array(count)
+
+  grownX.set(renderX)
+  grownY.set(renderY)
+  renderX = grownX
+  renderY = grownY
+}
+
 function handleSnapshot(data) {
   const arrivedAt = performance.now()
   const views = createSnapshotViews(data.buffer, data.count)
@@ -325,6 +372,8 @@ function handleSnapshot(data) {
 
   previousSnapshot = latestSnapshot
   latestSnapshot = { buffer: data.buffer, count: data.count, views, arrivedAt }
+
+  ensureRenderCapacity(data.count)
 }
 
 function renderParticles(time) {
@@ -366,16 +415,14 @@ function renderParticles(time) {
     for (const index of bucket) {
       const currentX = views.positions[index * 2]
       const currentY = views.positions[index * 2 + 1]
+      const isRespawned =
+        (views.flags[index] & PARTICLE_FLAG_RESPAWNED) !== 0
       let x = currentX
       let y = currentY
 
       // A recycled particle's slot still holds the old particle's position in
       // the previous snapshot, so interpolating would drag it across the screen.
-      if (
-        canInterpolate &&
-        index < previousCount &&
-        (views.flags[index] & PARTICLE_FLAG_RESPAWNED) === 0
-      ) {
+      if (canInterpolate && index < previousCount && !isRespawned) {
         const startX = previousViews.positions[index * 2]
         const startY = previousViews.positions[index * 2 + 1]
 
@@ -383,8 +430,21 @@ function renderParticles(time) {
         y = startY + (currentY - startY) * alpha
       }
 
-      context.moveTo(x, y)
-      context.lineTo(x + 0.01, y)
+      if (
+        isRespawned ||
+        Math.abs(x - renderX[index]) + Math.abs(y - renderY[index]) >
+          MAX_STREAK_LENGTH
+      ) {
+        renderX[index] = x
+        renderY[index] = y
+      }
+
+      // The streak spans motion since the last drawn frame, so it stays the
+      // right length at any display rate.
+      context.moveTo(renderX[index], renderY[index])
+      context.lineTo(x, y)
+      renderX[index] = x
+      renderY[index] = y
     }
 
     context.strokeStyle = PARTICLE_COLORS[bucketIndex]
@@ -394,7 +454,10 @@ function renderParticles(time) {
 }
 
 function drawFrame(time) {
-  context.fillStyle = '#000000'
+  const delta = Math.min(time - previousFrameTime, FRAME_DURATION * 2)
+
+  previousFrameTime = time
+  context.fillStyle = `rgba(0, 0, 0, ${1 - Math.exp(-delta / TRAIL_TAU)})`
   context.fillRect(0, 0, viewportWidth, viewportHeight)
 
   if (latestSnapshot) {
@@ -464,6 +527,10 @@ const initialSnapshotBuffers = Array.from(
 
 canvas.dataset.renderQuality = 'baseline'
 configureCanvas()
+document
+  .querySelector('#controls-dismiss')
+  .addEventListener('click', () => controlsDialog.close())
+controlsDialog.showModal()
 sendToWorker(
   {
     type: MESSAGE_INIT,

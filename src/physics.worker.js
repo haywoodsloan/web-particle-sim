@@ -5,6 +5,7 @@ import {
   FRAME_DURATION,
   GRAVITY_SCALE,
   HUE_COUNT,
+  HUE_STEP,
   MAX_AIR_RESISTANCE,
   MAX_CONTROL_PERCENT,
   MAX_PARTICLES_PER_FRAME,
@@ -38,21 +39,42 @@ const STEPS_PER_SECOND = 1000 / FRAME_DURATION
  * used. Rapier works in px/s^2, hence the 1000^2.
  */
 const ACCELERATION_TO_SECONDS = 1e6
-const PARTICLE_DENSITY = 0.0007
+/**
+ * Chosen so a uniform 1.8 px particle weighs what the old varying-radius
+ * particles averaged, which keeps the existing gravity tuning valid.
+ */
+const PARTICLE_DENSITY = 9.8e-5
+const PARTICLE_MASS = PARTICLE_DENSITY * Math.PI * PARTICLE_RADIUS ** 2
+/**
+ * Particles cover several times their own diameter in one 60 Hz step, so the
+ * solver runs finer than the snapshot rate or it skips straight past contacts.
+ */
+const PHYSICS_SUBSTEPS = 8
 const BOUNDARY_THICKNESS = 120
 /**
- * Softer than Rapier's default 30. Measured over 24k steps, 30 compounds the
- * kinetic energy to 1.098 while 10 holds it inside 1.02 indefinitely.
+ * Contact stiffness has to scale with the solve rate. Measured over 9000
+ * frames: freq 5/20/40 at 1/4/8 substeps are each the local optimum, and
+ * 8 substeps with freq 40 holds kinetic energy at 0.997.
  */
-const CONTACT_NATURAL_FREQUENCY = 10
+const CONTACT_NATURAL_FREQUENCY = 5 * PHYSICS_SUBSTEPS
 const SOLVER_ITERATIONS = 4
 /** Rapier scales allowed penetration by this; particles are only ~1 px. */
 const LENGTH_UNIT = 1
+/** Barnes-Hut opening angle. 0.5 is the usual accuracy/speed compromise. */
+const BARNES_HUT_THETA_SQUARED = 0.5 ** 2
+const MAX_TREE_DEPTH = 20
 const SNAPSHOT_POOL_SIZE = 4
+const SPAWN_JITTER = 2.5
+/**
+ * Spawning inside another particle makes the solver fling both apart, which
+ * invents energy, so positions are rejection sampled over a widening area.
+ */
+const SPAWN_PLACEMENT_ATTEMPTS = 8
 
 const world = new RAPIER.World({ x: 0, y: 0 })
 
-world.integrationParameters.dt = FRAME_DURATION / 1000
+world.integrationParameters.dt =
+  FRAME_DURATION / 1000 / PHYSICS_SUBSTEPS
 world.integrationParameters.numSolverIterations = SOLVER_ITERATIONS
 world.integrationParameters.lengthUnit = LENGTH_UNIT
 world.integrationParameters.contact_natural_frequency = CONTACT_NATURAL_FREQUENCY
@@ -84,6 +106,8 @@ let vy = new Float32Array(0)
 let mass = new Float32Array(0)
 let colorIndex = new Uint8Array(0)
 let respawned = new Uint8Array(0)
+/** Chains bodies that share a quadtree leaf. */
+let bodyNext = new Int32Array(0)
 
 const pointer = {
   x: null,
@@ -100,11 +124,15 @@ const randomBetween = (minimum, maximum) =>
 const getAirResistance = () =>
   MAX_AIR_RESISTANCE * (airResistancePercent / MAX_CONTROL_PERCENT)
 
-/** Rapier damps as v /= (1 + dt * damping); solve for the old per-step factor. */
+/** Rapier damps as v /= (1 + dt * damping) each substep; solve for one frame. */
 const getLinearDamping = () => {
   const retained = 1 - getAirResistance()
 
-  return retained <= 0 ? 0 : (1 / retained - 1) * STEPS_PER_SECOND
+  return retained <= 0
+    ? 0
+    : (retained ** (-1 / PHYSICS_SUBSTEPS) - 1) *
+        STEPS_PER_SECOND *
+        PHYSICS_SUBSTEPS
 }
 
 function ensureCapacity(required) {
@@ -128,6 +156,7 @@ function ensureCapacity(required) {
   mass = copy(mass)
   colorIndex = copy(colorIndex)
   respawned = copy(respawned)
+  bodyNext = copy(bodyNext)
   capacity = grown
 }
 
@@ -199,8 +228,74 @@ function applyParticleLimit(limit) {
   recycleCursor = particleLimit === 0 ? 0 : recycleCursor % particleLimit
 }
 
+const spawnQueryShape = new RAPIER.Ball(PARTICLE_RADIUS)
+const spawnQueryPoint = { x: 0, y: 0 }
+/** Bodies created this frame are absent from the broad phase until it steps. */
+const batchSpawnX = []
+const batchSpawnY = []
+
+function isSpawnPositionFree(positionX, positionY, excludedBody) {
+  const contactSquared = (PARTICLE_RADIUS * 2) ** 2
+
+  for (let index = 0; index < batchSpawnX.length; index += 1) {
+    const offsetX = batchSpawnX[index] - positionX
+    const offsetY = batchSpawnY[index] - positionY
+
+    if (offsetX ** 2 + offsetY ** 2 < contactSquared) {
+      return false
+    }
+  }
+
+  spawnQueryPoint.x = positionX
+  spawnQueryPoint.y = positionY
+
+  return (
+    world.intersectionWithShape(
+      spawnQueryPoint,
+      0,
+      spawnQueryShape,
+      RAPIER.QueryFilterFlags.EXCLUDE_FIXED,
+      undefined,
+      undefined,
+      excludedBody,
+    ) === null
+  )
+}
+
 function spawnParticle(x, y, heading, pointerSpeed, hue) {
   if (particleLimit === 0) {
+    return
+  }
+
+  const isRecycling = bodies.length >= particleLimit
+  // Resolved before the search so it can ignore the body about to move away.
+  const recycledBody = isRecycling ? bodies[recycleCursor] : undefined
+  let positionX = 0
+  let positionY = 0
+  let hasPlacement = false
+
+  for (
+    let attempt = 0;
+    attempt < SPAWN_PLACEMENT_ATTEMPTS && !hasPlacement;
+    attempt += 1
+  ) {
+    const jitter = SPAWN_JITTER + attempt * PARTICLE_RADIUS
+
+    positionX = clamp(
+      x + randomBetween(-jitter, jitter),
+      PARTICLE_RADIUS,
+      Math.max(PARTICLE_RADIUS, viewportWidth - PARTICLE_RADIUS),
+    )
+    positionY = clamp(
+      y + randomBetween(-jitter, jitter),
+      PARTICLE_RADIUS,
+      Math.max(PARTICLE_RADIUS, viewportHeight - PARTICLE_RADIUS),
+    )
+    hasPlacement = isSpawnPositionFree(positionX, positionY, recycledBody)
+  }
+
+  // Nowhere to put it without an overlap, so the field is simply full here.
+  if (!hasPlacement) {
     return
   }
 
@@ -210,25 +305,13 @@ function spawnParticle(x, y, heading, pointerSpeed, hue) {
     randomBetween(0.72, 1.12) *
     EMISSION_VELOCITY_SCALE *
     STEPS_PER_SECOND
-  const positionX = clamp(
-    x + randomBetween(-2.5, 2.5),
-    PARTICLE_RADIUS,
-    Math.max(PARTICLE_RADIUS, viewportWidth - PARTICLE_RADIUS),
-  )
-  const positionY = clamp(
-    y + randomBetween(-2.5, 2.5),
-    PARTICLE_RADIUS,
-    Math.max(PARTICLE_RADIUS, viewportHeight - PARTICLE_RADIUS),
-  )
   const velocity = {
     x: Math.cos(heading + spread) * speed,
     y: Math.sin(heading + spread) * speed,
   }
   let index
 
-  if (bodies.length < particleLimit) {
-    const visualRadius = randomBetween(0.35, 0.95)
-
+  if (!isRecycling) {
     ensureCapacity(bodies.length + 1)
     index = bodies.length
 
@@ -243,7 +326,7 @@ function spawnParticle(x, y, heading, pointerSpeed, hue) {
 
     world.createCollider(
       RAPIER.ColliderDesc.ball(PARTICLE_RADIUS)
-        .setMass(PARTICLE_DENSITY * Math.PI * visualRadius ** 2)
+        .setMass(PARTICLE_MASS)
         .setRestitution(1)
         .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max)
         .setFriction(0)
@@ -267,8 +350,10 @@ function spawnParticle(x, y, heading, pointerSpeed, hue) {
   py[index] = positionY
   vx[index] = velocity.x / STEPS_PER_SECOND
   vy[index] = velocity.y / STEPS_PER_SECOND
-  colorIndex[index] = Math.floor(hue / 10) % HUE_COUNT
+  colorIndex[index] = Math.floor(hue / HUE_STEP) % HUE_COUNT
   respawned[index] = 1
+  batchSpawnX.push(positionX)
+  batchSpawnY.push(positionY)
 }
 
 function emitFromPointer(x, y, timeStamp) {
@@ -327,38 +412,284 @@ function emitFromPointer(x, y, timeStamp) {
 
 const appliedImpulse = { x: 0, y: 0 }
 
-function applyFieldImpulses() {
-  const count = bodies.length
-  const hasHole =
-    pointer.holePolarity !== 0 && pointer.x !== null && pointer.y !== null
-  let totalMass = 0
-  let weightedX = 0
-  let weightedY = 0
+/**
+ * Barnes-Hut quadtree. A centre-of-mass monopole cannot produce local
+ * attraction at all, so clusters could never form and existing ones were torn
+ * apart. This approximates true pairwise gravity in O(n log n).
+ */
+let treeCapacity = 0
+let treeNodeCount = 0
+let treeChildren = new Int32Array(0)
+let treeParent = new Int32Array(0)
+let treeBody = new Int32Array(0)
+let treeMass = new Float64Array(0)
+let treeWeightedX = new Float64Array(0)
+let treeWeightedY = new Float64Array(0)
+let treeCenterX = new Float64Array(0)
+let treeCenterY = new Float64Array(0)
+let treeMinX = new Float64Array(0)
+let treeMinY = new Float64Array(0)
+let treeSize = new Float64Array(0)
+/** Depth-first over a 4-ary tree never needs more than 3 * depth + 1 slots. */
+const treeStack = new Int32Array(512)
 
-  for (let index = 0; index < count; index += 1) {
-    totalMass += mass[index]
-    weightedX += px[index] * mass[index]
-    weightedY += py[index] * mass[index]
+let gravityAccelerationX = 0
+let gravityAccelerationY = 0
+
+function ensureTreeCapacity(required) {
+  if (treeCapacity >= required) {
+    return
   }
 
-  for (let index = 0; index < count; index += 1) {
-    const bodyMass = mass[index]
-    // A monopole must not attract itself.
-    const otherMass = totalMass - bodyMass
-    let accelerationX = 0
-    let accelerationY = 0
+  const grown = Math.max(required, treeCapacity * 2, 256)
 
-    if (otherMass > 0) {
-      const offsetX = (weightedX - px[index] * bodyMass) / otherMass - px[index]
-      const offsetY = (weightedY - py[index] * bodyMass) / otherMass - py[index]
-      const softened =
-        offsetX ** 2 + offsetY ** 2 + PARTICLE_GRAVITY_SOFTENING ** 2
+  const copyInt = (source, stride) => {
+    const next = new Int32Array(grown * stride)
+
+    next.set(source)
+
+    return next
+  }
+  const copyFloat = (source) => {
+    const next = new Float64Array(grown)
+
+    next.set(source)
+
+    return next
+  }
+
+  treeChildren = copyInt(treeChildren, 4)
+  treeParent = copyInt(treeParent, 1)
+  treeBody = copyInt(treeBody, 1)
+  treeMass = copyFloat(treeMass)
+  treeWeightedX = copyFloat(treeWeightedX)
+  treeWeightedY = copyFloat(treeWeightedY)
+  treeCenterX = copyFloat(treeCenterX)
+  treeCenterY = copyFloat(treeCenterY)
+  treeMinX = copyFloat(treeMinX)
+  treeMinY = copyFloat(treeMinY)
+  treeSize = copyFloat(treeSize)
+  treeCapacity = grown
+}
+
+function createTreeNode(minX, minY, size, parent) {
+  const node = treeNodeCount
+
+  treeNodeCount += 1
+  treeChildren[node * 4] = -1
+  treeChildren[node * 4 + 1] = -1
+  treeChildren[node * 4 + 2] = -1
+  treeChildren[node * 4 + 3] = -1
+  treeParent[node] = parent
+  treeBody[node] = -1
+  treeMass[node] = 0
+  treeWeightedX[node] = 0
+  treeWeightedY[node] = 0
+  treeMinX[node] = minX
+  treeMinY[node] = minY
+  treeSize[node] = size
+
+  return node
+}
+
+function addBodyToNode(node, index) {
+  treeMass[node] += mass[index]
+  treeWeightedX[node] += px[index] * mass[index]
+  treeWeightedY[node] += py[index] * mass[index]
+}
+
+function getChildForBody(node, index) {
+  const half = treeSize[node] / 2
+  const quadrant =
+    (px[index] >= treeMinX[node] + half ? 1 : 0) +
+    (py[index] >= treeMinY[node] + half ? 2 : 0)
+
+  return treeChildren[node * 4 + quadrant]
+}
+
+function insertBody(node, index, depth) {
+  if (treeChildren[node * 4] === -1) {
+    if (treeBody[node] === -1) {
+      treeBody[node] = index
+      bodyNext[index] = -1
+      addBodyToNode(node, index)
+      return
+    }
+
+    // Coincident or near-coincident bodies would subdivide forever, so past
+    // the depth cap a leaf just holds a chain of them.
+    if (depth >= MAX_TREE_DEPTH) {
+      bodyNext[index] = treeBody[node]
+      treeBody[node] = index
+      addBodyToNode(node, index)
+      return
+    }
+
+    const existing = treeBody[node]
+    const half = treeSize[node] / 2
+    const minX = treeMinX[node]
+    const minY = treeMinY[node]
+
+    ensureTreeCapacity(treeNodeCount + 4)
+    treeBody[node] = -1
+    treeMass[node] = 0
+    treeWeightedX[node] = 0
+    treeWeightedY[node] = 0
+    treeChildren[node * 4] = createTreeNode(minX, minY, half, node)
+    treeChildren[node * 4 + 1] = createTreeNode(minX + half, minY, half, node)
+    treeChildren[node * 4 + 2] = createTreeNode(minX, minY + half, half, node)
+    treeChildren[node * 4 + 3] = createTreeNode(
+      minX + half,
+      minY + half,
+      half,
+      node,
+    )
+
+    let moved = existing
+
+    while (moved !== -1) {
+      const next = bodyNext[moved]
+
+      insertBody(getChildForBody(node, moved), moved, depth + 1)
+      moved = next
+    }
+  }
+
+  insertBody(getChildForBody(node, index), index, depth + 1)
+}
+
+function buildGravityTree(count) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+
+  for (let index = 0; index < count; index += 1) {
+    if (px[index] < minX) minX = px[index]
+    if (py[index] < minY) minY = py[index]
+    if (px[index] > maxX) maxX = px[index]
+    if (py[index] > maxY) maxY = py[index]
+  }
+
+  // A hair of slack keeps the far edge inside the root cell.
+  const size = Math.max(maxX - minX, maxY - minY, 1) * 1.0001
+
+  ensureTreeCapacity(count * 4 + 16)
+  treeNodeCount = 0
+  createTreeNode(minX, minY, size, -1)
+
+  for (let index = 0; index < count; index += 1) {
+    insertBody(0, index, 0)
+  }
+
+  // Children always have a higher index than their parent, so one reverse pass
+  // both finishes each node and folds it into its parent.
+  for (let node = treeNodeCount - 1; node >= 0; node -= 1) {
+    const nodeMass = treeMass[node]
+
+    if (nodeMass > 0) {
+      treeCenterX[node] = treeWeightedX[node] / nodeMass
+      treeCenterY[node] = treeWeightedY[node] / nodeMass
+    }
+
+    const parent = treeParent[node]
+
+    if (parent >= 0) {
+      treeMass[parent] += nodeMass
+      treeWeightedX[parent] += treeWeightedX[node]
+      treeWeightedY[parent] += treeWeightedY[node]
+    }
+  }
+}
+
+function accumulateTreeGravity(index) {
+  const particleX = px[index]
+  const particleY = py[index]
+  let accelerationX = 0
+  let accelerationY = 0
+  let top = 0
+
+  treeStack[top] = 0
+  top += 1
+
+  while (top > 0) {
+    top -= 1
+
+    const node = treeStack[top]
+    const nodeMass = treeMass[node]
+
+    if (nodeMass <= 0) {
+      continue
+    }
+
+    if (treeChildren[node * 4] === -1) {
+      for (let other = treeBody[node]; other !== -1; other = bodyNext[other]) {
+        if (other === index) {
+          continue
+        }
+
+        const offsetX = px[other] - particleX
+        const offsetY = py[other] - particleY
+        const softened =
+          offsetX ** 2 + offsetY ** 2 + PARTICLE_GRAVITY_SOFTENING ** 2
+        const scale =
+          (PARTICLE_GRAVITY * mass[other] * ACCELERATION_TO_SECONDS) /
+          (softened * Math.sqrt(softened))
+
+        accelerationX += offsetX * scale
+        accelerationY += offsetY * scale
+      }
+
+      continue
+    }
+
+    const offsetX = treeCenterX[node] - particleX
+    const offsetY = treeCenterY[node] - particleY
+    const distanceSquared = offsetX ** 2 + offsetY ** 2
+
+    if (
+      treeSize[node] ** 2 <
+      BARNES_HUT_THETA_SQUARED * distanceSquared
+    ) {
+      const softened = distanceSquared + PARTICLE_GRAVITY_SOFTENING ** 2
       const scale =
-        (PARTICLE_GRAVITY * otherMass * ACCELERATION_TO_SECONDS) /
+        (PARTICLE_GRAVITY * nodeMass * ACCELERATION_TO_SECONDS) /
         (softened * Math.sqrt(softened))
 
       accelerationX += offsetX * scale
       accelerationY += offsetY * scale
+      continue
+    }
+
+    for (let quadrant = 0; quadrant < 4; quadrant += 1) {
+      treeStack[top] = treeChildren[node * 4 + quadrant]
+      top += 1
+    }
+  }
+
+  gravityAccelerationX = accelerationX
+  gravityAccelerationY = accelerationY
+}
+
+function applyFieldImpulses() {
+  const count = bodies.length
+  const hasHole =
+    pointer.holePolarity !== 0 && pointer.x !== null && pointer.y !== null
+  const hasGravity = count > 1
+
+  if (hasGravity) {
+    buildGravityTree(count)
+  }
+
+  for (let index = 0; index < count; index += 1) {
+    const bodyMass = mass[index]
+    let accelerationX = 0
+    let accelerationY = 0
+
+    if (hasGravity) {
+      accumulateTreeGravity(index)
+      accelerationX += gravityAccelerationX
+      accelerationY += gravityAccelerationY
     }
 
     if (hasHole) {
@@ -452,7 +783,14 @@ function step() {
     applyFieldImpulses()
   }
 
-  world.step()
+  // The impulse above already covers a whole frame, so it is applied once and
+  // only the contact solve is subdivided.
+  for (let substep = 0; substep < PHYSICS_SUBSTEPS; substep += 1) {
+    world.step()
+  }
+
+  batchSpawnX.length = 0
+  batchSpawnY.length = 0
   readBackState()
   stepIndex += 1
   sendSnapshot()

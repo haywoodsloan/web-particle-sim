@@ -125,10 +125,94 @@ body {
   }
 }
 
+#controls-dialog {
+  margin: auto;
+  padding: 28px 34px;
+  border: 1px solid rgba(56, 245, 138, 0.55);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.92);
+  color: #38f58a;
+  font-family: 'Trebuchet MS', 'Aptos Display', sans-serif;
+  font-weight: 900;
+  line-height: 1;
+  text-shadow: 0 0 14px rgba(56, 245, 138, 0.42);
+  box-shadow: 0 0 34px rgba(56, 245, 138, 0.25);
+}
+
+#controls-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.72);
+}
+
+#controls-dialog h1 {
+  margin: 0 0 22px;
+  font-size: 34px;
+  letter-spacing: 0.02em;
+  text-align: center;
+}
+
+#controls-dialog dl {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 14px 26px;
+  margin: 0 0 28px;
+  font-size: 19px;
+}
+
+#controls-dialog dt {
+  text-align: right;
+  white-space: nowrap;
+}
+
+#controls-dialog dt span {
+  margin: 0 0.7em;
+  font-size: 0.72em;
+  font-weight: 400;
+}
+
+#controls-dialog dd {
+  margin: 0;
+  opacity: 0.78;
+  white-space: nowrap;
+}
+
+#controls-dismiss {
+  display: block;
+  width: 100%;
+  padding: 11px;
+  border: 1px solid rgba(56, 245, 138, 0.55);
+  border-radius: 6px;
+  background: rgba(56, 245, 138, 0.1);
+  color: inherit;
+  font: inherit;
+  font-size: 21px;
+  letter-spacing: 0.06em;
+  text-shadow: inherit;
+  cursor: pointer;
+}
+
+#controls-dismiss:hover,
+#controls-dismiss:focus-visible {
+  background: rgba(56, 245, 138, 0.22);
+  outline: none;
+}
+
 @media (max-width: 600px) {
   #control-status {
     bottom: max(28px, env(safe-area-inset-bottom));
     font-size: 30px;
+  }
+
+  #controls-dialog {
+    padding: 22px 24px;
+  }
+
+  #controls-dialog h1 {
+    font-size: 26px;
+  }
+
+  #controls-dialog dl {
+    font-size: 16px;
+    gap: 11px 18px;
   }
 }
 
