@@ -32,10 +32,9 @@ import {
   createSnapshotViews,
   getSnapshotByteLength,
 } from './simulation-shared.js'
+import { INSTANCE_FLOATS, createRenderer } from './webgl-renderer.js'
 
 const CONTROL_STEP = 10
-/** Drawn size tracks the collider, so what you see is what collides. */
-const PARTICLE_DIAMETER = PARTICLE_RADIUS * 2
 const BRIGHTNESS_LEVELS = 8
 const MAX_PIXEL_RATIO = 2
 /** Trail decay constant; keeps the veil independent of frame rate. */
@@ -46,16 +45,36 @@ const SNAPSHOT_POOL_SIZE = 4
 const SNAPSHOT_INTERVAL_SMOOTHING = 0.15
 const MAX_INTERPOLATION_SPAN = 250
 
-const PARTICLE_COLORS = Array.from(
-  { length: HUE_COUNT * BRIGHTNESS_LEVELS },
-  (_, bucketIndex) => {
-    const colorIndex = Math.floor(bucketIndex / BRIGHTNESS_LEVELS)
-    const brightnessIndex = bucketIndex % BRIGHTNESS_LEVELS
-    const lightness = 25 + (37 * brightnessIndex) / (BRIGHTNESS_LEVELS - 1)
+/** Fully saturated hue to linear-ish rgb, matching the old hsl() palette. */
+function hueToChannels(hue, lightness) {
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * 1
+  const sector = hue / 60
+  const second = chroma * (1 - Math.abs((sector % 2) - 1))
+  const base = lightness - chroma / 2
+  const wheel = [
+    [chroma, second, 0],
+    [second, chroma, 0],
+    [0, chroma, second],
+    [0, second, chroma],
+    [second, 0, chroma],
+    [chroma, 0, second],
+  ][Math.floor(sector) % 6]
 
-    return `hsl(${colorIndex * HUE_STEP}, 100%, ${lightness}%)`
-  },
-)
+  return wheel.map((channel) => channel + base)
+}
+
+const PARTICLE_COLORS = new Float32Array(HUE_COUNT * BRIGHTNESS_LEVELS * 3)
+
+for (let bucket = 0; bucket < HUE_COUNT * BRIGHTNESS_LEVELS; bucket += 1) {
+  const colorIndex = Math.floor(bucket / BRIGHTNESS_LEVELS)
+  const brightnessIndex = bucket % BRIGHTNESS_LEVELS
+  const lightness = (25 + (37 * brightnessIndex) / (BRIGHTNESS_LEVELS - 1)) / 100
+
+  PARTICLE_COLORS.set(
+    hueToChannels(colorIndex * HUE_STEP, lightness),
+    bucket * 3,
+  )
+}
 
 const getBrightnessIndex = (speed) =>
   Math.round(
@@ -96,16 +115,13 @@ const canvas = document.querySelector('#particle-canvas')
 const pointerHole = document.querySelector('#pointer-hole')
 const controlStatus = document.querySelector('#control-status')
 const controlsDialog = document.querySelector('#controls-dialog')
-const context = canvas.getContext('2d', { alpha: false })
+const context = createRenderer(canvas, PARTICLE_RADIUS)
 const physicsWorker = new Worker(
   new URL('./physics.worker.js', import.meta.url),
   { type: 'module' },
 )
 
-const colorBuckets = Array.from(
-  { length: HUE_COUNT * BRIGHTNESS_LEVELS },
-  () => [],
-)
+let instanceData = new Float32Array(0)
 let previousSnapshot = null
 let latestSnapshot = null
 let renderX = new Float32Array(0)
@@ -149,11 +165,7 @@ function configureCanvas() {
   canvas.style.width = `${viewportWidth}px`
   canvas.style.height = `${viewportHeight}px`
 
-  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
-  context.globalCompositeOperation = 'source-over'
-  context.globalAlpha = 1
-  context.lineCap = 'round'
-  context.lineWidth = PARTICLE_DIAMETER
+  context.resize(viewportWidth, viewportHeight, pixelRatio)
 }
 
 function showControlStatus(message) {
@@ -374,7 +386,7 @@ function handleSnapshot(data) {
   ensureRenderCapacity(data.count)
 }
 
-function renderParticles(time) {
+function renderParticles(time, veilAlpha) {
   const { count, views } = latestSnapshot
   const previousViews = previousSnapshot?.views
   const previousCount = previousSnapshot?.count ?? 0
@@ -384,7 +396,36 @@ function renderParticles(time) {
   const span = clamp(snapshotInterval, FRAME_DURATION, MAX_INTERPOLATION_SPAN)
   const alpha = clamp((time - latestSnapshot.arrivedAt) / span, 0, 1)
 
+  if (instanceData.length < count * INSTANCE_FLOATS) {
+    instanceData = new Float32Array(count * INSTANCE_FLOATS)
+  }
+
   for (let index = 0; index < count; index += 1) {
+    const currentX = views.positions[index * 2]
+    const currentY = views.positions[index * 2 + 1]
+    const isRespawned = (views.flags[index] & PARTICLE_FLAG_RESPAWNED) !== 0
+    let x = currentX
+    let y = currentY
+
+    // A recycled particle's slot still holds the old particle's position in
+    // the previous snapshot, so interpolating would drag it across the screen.
+    if (canInterpolate && index < previousCount && !isRespawned) {
+      const startX = previousViews.positions[index * 2]
+      const startY = previousViews.positions[index * 2 + 1]
+
+      x = startX + (currentX - startX) * alpha
+      y = startY + (currentY - startY) * alpha
+    }
+
+    if (
+      isRespawned ||
+      Math.abs(x - renderX[index]) + Math.abs(y - renderY[index]) >
+        MAX_STREAK_LENGTH
+    ) {
+      renderX[index] = x
+      renderY[index] = y
+    }
+
     // A retiring particle keeps moving and simply dims, so its fade scales the
     // brightness its speed earned.
     const fade =
@@ -392,77 +433,36 @@ function renderParticles(time) {
     const brightnessIndex = Math.round(
       (getBrightnessIndex(views.speeds[index]) * fade) / PARTICLE_FADE_LEVELS,
     )
+    const palette =
+      (views.colors[index] * BRIGHTNESS_LEVELS + brightnessIndex) * 3
+    const offset = index * INSTANCE_FLOATS
 
-    colorBuckets[
-      views.colors[index] * BRIGHTNESS_LEVELS + brightnessIndex
-    ].push(index)
+    // The streak spans motion since the last drawn frame, so it stays the
+    // right length at any display rate.
+    instanceData[offset] = renderX[index]
+    instanceData[offset + 1] = renderY[index]
+    instanceData[offset + 2] = x
+    instanceData[offset + 3] = y
+    instanceData[offset + 4] = PARTICLE_COLORS[palette]
+    instanceData[offset + 5] = PARTICLE_COLORS[palette + 1]
+    instanceData[offset + 6] = PARTICLE_COLORS[palette + 2]
+    renderX[index] = x
+    renderY[index] = y
   }
 
-  // Retiring particles ride the same buckets, so the fade costs no extra
-  // strokes.
-  for (
-    let bucketIndex = 0;
-    bucketIndex < colorBuckets.length;
-    bucketIndex += 1
-  ) {
-    const bucket = colorBuckets[bucketIndex]
-
-    if (bucket.length === 0) {
-      continue
-    }
-
-    context.beginPath()
-
-    for (const index of bucket) {
-      const currentX = views.positions[index * 2]
-      const currentY = views.positions[index * 2 + 1]
-      const isRespawned =
-        (views.flags[index] & PARTICLE_FLAG_RESPAWNED) !== 0
-      let x = currentX
-      let y = currentY
-
-      // A recycled particle's slot still holds the old particle's position in
-      // the previous snapshot, so interpolating would drag it across the screen.
-      if (canInterpolate && index < previousCount && !isRespawned) {
-        const startX = previousViews.positions[index * 2]
-        const startY = previousViews.positions[index * 2 + 1]
-
-        x = startX + (currentX - startX) * alpha
-        y = startY + (currentY - startY) * alpha
-      }
-
-      if (
-        isRespawned ||
-        Math.abs(x - renderX[index]) + Math.abs(y - renderY[index]) >
-          MAX_STREAK_LENGTH
-      ) {
-        renderX[index] = x
-        renderY[index] = y
-      }
-
-      // The streak spans motion since the last drawn frame, so it stays the
-      // right length at any display rate.
-      context.moveTo(renderX[index], renderY[index])
-      context.lineTo(x, y)
-      renderX[index] = x
-      renderY[index] = y
-    }
-
-    context.strokeStyle = PARTICLE_COLORS[bucketIndex]
-    context.stroke()
-    bucket.length = 0
-  }
+  context.draw(instanceData, count, veilAlpha)
 }
 
 function drawFrame(time) {
   const delta = Math.min(time - previousFrameTime, FRAME_DURATION * 2)
+  const veilAlpha = 1 - Math.exp(-delta / TRAIL_TAU)
 
   previousFrameTime = time
-  context.fillStyle = `rgba(0, 0, 0, ${1 - Math.exp(-delta / TRAIL_TAU)})`
-  context.fillRect(0, 0, viewportWidth, viewportHeight)
 
   if (latestSnapshot) {
-    renderParticles(time)
+    renderParticles(time, veilAlpha)
+  } else {
+    context.draw(instanceData, 0, veilAlpha)
   }
 
   requestAnimationFrame(drawFrame)
