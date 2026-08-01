@@ -99,6 +99,35 @@ body {
     0 0 26px 6px rgba(255, 255, 255, 0.45);
 }
 
+#particle-count,
+#frame-rate {
+  position: fixed;
+  z-index: 1;
+  top: max(16px, env(safe-area-inset-top));
+  color: var(--accent);
+  font-family: var(--display-font);
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 14px var(--accent-glow);
+  pointer-events: none;
+  opacity: 0;
+}
+
+#particle-count {
+  left: max(16px, env(safe-area-inset-left));
+}
+
+#frame-rate {
+  right: max(16px, env(safe-area-inset-right));
+}
+
+#particle-count.is-visible,
+#frame-rate.is-visible {
+  opacity: 0.8;
+}
+
 #control-status {
   position: fixed;
   z-index: 1;

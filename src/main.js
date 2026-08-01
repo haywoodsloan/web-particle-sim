@@ -46,6 +46,8 @@ const MAX_STREAK_LENGTH = 160
 const SNAPSHOT_POOL_SIZE = 4
 const SNAPSHOT_INTERVAL_SMOOTHING = 0.15
 const MAX_INTERPOLATION_SPAN = 250
+/** How often the stats overlay refreshes, in ms. */
+const STATS_INTERVAL = 250
 
 const getLightness = (speed) =>
   MIN_LIGHTNESS +
@@ -55,11 +57,13 @@ const getLightness = (speed) =>
 document.querySelector('#app').innerHTML = `
   <canvas
     id="particle-canvas"
-    aria-label="Interactive rainbow particle simulation. Hold the left mouse button for a black hole or the right mouse button for a white hole."
+    aria-label="Interactive rainbow particle simulation. Hold the left mouse button for a gravity well or the right mouse button for a repulsion field."
   >
-    Move your pointer across the screen to emit rainbow particles.
+    Move your pointer across the screen to spray rainbow particles.
   </canvas>
   <div id="pointer-hole" aria-hidden="true"></div>
+  <div id="particle-count" aria-hidden="true"></div>
+  <div id="frame-rate" aria-hidden="true"></div>
   <div
     id="control-status"
     role="status"
@@ -69,10 +73,10 @@ document.querySelector('#app').innerHTML = `
   <dialog id="controls-dialog" aria-labelledby="controls-title">
     <h1 id="controls-title">Controls</h1>
     <dl>
-      <dt>Move</dt><dd>Emit particles</dd>
-      <dt>Left click</dt><dd>Black hole</dd>
-      <dt>Right click</dt><dd>White hole</dd>
-      <dt>Space</dt><dd>Toggle emission</dd>
+      <dt>Mouse</dt><dd>Particle spray</dd>
+      <dt>Left click</dt><dd>Gravity well</dd>
+      <dt>Right click</dt><dd>Repulsion field</dd>
+      <dt>Space</dt><dd>Toggle spray</dd>
       <dt>-<span>/</span>=</dt><dd>Gravity</dd>
       <dt>[<span>/</span>]</dt><dd>Air resistance</dd>
       <dt>;<span>/</span>'</dt><dd>Particle limit</dd>
@@ -83,6 +87,8 @@ document.querySelector('#app').innerHTML = `
 
 const canvas = document.querySelector('#particle-canvas')
 const pointerHole = document.querySelector('#pointer-hole')
+const particleCount = document.querySelector('#particle-count')
+const frameRate = document.querySelector('#frame-rate')
 const controlStatus = document.querySelector('#control-status')
 const controlsDialog = document.querySelector('#controls-dialog')
 const context = createRenderer(canvas, PARTICLE_RADIUS)
@@ -104,6 +110,9 @@ let pixelRatio = 1
 let gravityPercent = 0
 let airResistancePercent = 0
 let isParticleEmissionEnabled = true
+let areStatsVisible = false
+let statsFrames = 0
+let statsSince = 0
 let particleLimit = DEFAULT_PARTICLE_LIMIT
 
 const pointer = {
@@ -186,6 +195,14 @@ function adjustParticleLimit(direction) {
   showControlStatus(`Particle Limit: ${particleLimit}`)
 }
 
+function toggleStats() {
+  areStatsVisible = !areStatsVisible
+  particleCount.classList.toggle('is-visible', areStatsVisible)
+  frameRate.classList.toggle('is-visible', areStatsVisible)
+  statsFrames = 0
+  statsSince = performance.now()
+}
+
 function handleKeyDown(event) {
   // The dialog owns the keyboard while it is open.
   if (controlsDialog.open) {
@@ -193,6 +210,13 @@ function handleKeyDown(event) {
       controlsDialog.close()
     }
 
+    return
+  }
+
+  // Ahead of the modifier guard below, which would otherwise swallow it.
+  if (event.ctrlKey && event.shiftKey && event.code === 'Space') {
+    toggleStats()
+    event.preventDefault()
     return
   }
 
@@ -428,6 +452,19 @@ function drawFrame(time) {
     renderParticles(time, veilAlpha)
   } else {
     context.draw(instanceData, 0, veilAlpha)
+  }
+
+  if (areStatsVisible) {
+    statsFrames += 1
+
+    const elapsed = time - statsSince
+
+    if (elapsed >= STATS_INTERVAL) {
+      particleCount.textContent = `${latestSnapshot?.count ?? 0}`
+      frameRate.textContent = `${Math.round((statsFrames * 1000) / elapsed)} fps`
+      statsFrames = 0
+      statsSince = time
+    }
   }
 
   requestAnimationFrame(drawFrame)
