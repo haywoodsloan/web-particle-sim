@@ -8,6 +8,7 @@ import {
   HUE_COUNT,
   HUE_STEP,
   MAX_CONTROL_PERCENT,
+  MAX_RETIRING_PARTICLES,
   MESSAGE_AIR_RESISTANCE,
   MESSAGE_EMISSION,
   MESSAGE_GRAVITY,
@@ -20,6 +21,8 @@ import {
   MESSAGE_RESIZE,
   MESSAGE_SNAPSHOT,
   MESSAGE_VISIBILITY,
+  PARTICLE_FADE_LEVELS,
+  PARTICLE_FADE_SHIFT,
   PARTICLE_FLAG_RESPAWNED,
   PARTICLE_LIMIT_STEP,
   PARTICLE_RADIUS,
@@ -373,11 +376,6 @@ function handleSnapshot(data) {
 
 function renderParticles(time) {
   const { count, views } = latestSnapshot
-
-  if (count === 0) {
-    return
-  }
-
   const previousViews = previousSnapshot?.views
   const previousCount = previousSnapshot?.count ?? 0
   const canInterpolate =
@@ -387,13 +385,21 @@ function renderParticles(time) {
   const alpha = clamp((time - latestSnapshot.arrivedAt) / span, 0, 1)
 
   for (let index = 0; index < count; index += 1) {
-    const brightnessIndex = getBrightnessIndex(views.speeds[index])
+    // A retiring particle keeps moving and simply dims, so its fade scales the
+    // brightness its speed earned.
+    const fade =
+      (views.flags[index] >> PARTICLE_FADE_SHIFT) & PARTICLE_FADE_LEVELS
+    const brightnessIndex = Math.round(
+      (getBrightnessIndex(views.speeds[index]) * fade) / PARTICLE_FADE_LEVELS,
+    )
 
     colorBuckets[
       views.colors[index] * BRIGHTNESS_LEVELS + brightnessIndex
     ].push(index)
   }
 
+  // Retiring particles ride the same buckets, so the fade costs no extra
+  // strokes.
   for (
     let bucketIndex = 0;
     bucketIndex < colorBuckets.length;
@@ -517,7 +523,10 @@ physicsWorker.onmessage = ({ data }) => {
 
 const initialSnapshotBuffers = Array.from(
   { length: SNAPSHOT_POOL_SIZE },
-  () => new ArrayBuffer(getSnapshotByteLength(DEFAULT_PARTICLE_LIMIT)),
+  () =>
+    new ArrayBuffer(
+      getSnapshotByteLength(DEFAULT_PARTICLE_LIMIT + MAX_RETIRING_PARTICLES),
+    ),
 )
 
 configureCanvas()

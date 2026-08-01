@@ -32,6 +32,11 @@ const SNAPSHOT_BYTES_PER_PARTICLE = 14
 /** Set when the main thread must not interpolate from its previous snapshot. */
 export const SNAPSHOT_FLAG_DISCONTINUOUS = 1
 export const PARTICLE_FLAG_RESPAWNED = 1
+/** Fade level occupies the bits above the respawn flag. */
+export const PARTICLE_FADE_SHIFT = 1
+export const PARTICLE_FADE_LEVELS = 7
+/** Retiring particles keep simulating, so the field can exceed its limit. */
+export const MAX_RETIRING_PARTICLES = 250
 
 export const clamp = (value, minimum, maximum) =>
   Math.min(Math.max(value, minimum), maximum)

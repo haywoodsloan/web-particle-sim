@@ -28,6 +28,8 @@ const SNAPSHOT_HEADER_BYTES: usize = 16;
 const SNAPSHOT_BYTES_PER_PARTICLE: usize = 14;
 const SNAPSHOT_FLAG_DISCONTINUOUS: u32 = 1;
 const PARTICLE_FLAG_RESPAWNED: u8 = 1;
+/// Fade level occupies the bits above the respawn flag.
+const PARTICLE_FADE_SHIFT: u8 = 1;
 
 /// Tuning is expressed in px/ms^2 but the solver integrates in frames.
 const ACCELERATION_TO_FRAMES: f32 = FRAME_DURATION * FRAME_DURATION;
@@ -45,6 +47,11 @@ const BARNES_HUT_THETA_SQUARED: f32 = 0.5 * 0.5;
 const MAX_TREE_DEPTH: u32 = 20;
 const SPAWN_JITTER: f32 = 2.5;
 const SPAWN_PLACEMENT_ATTEMPTS: usize = 8;
+/// A replaced particle keeps colliding while it dims out over these frames.
+const RETIRE_FADE_FRAMES: f32 = 9.0;
+const RETIRE_FADE_LEVELS: f32 = 7.0;
+/// Past this backlog the longest-running fades are cut short.
+const MAX_RETIRING: usize = 250;
 
 /// Constant-folded; `sqrt` cannot run in a `const` initialiser.
 #[inline]
@@ -83,9 +90,13 @@ struct World {
     acceleration_y: Vec<f32>,
     color: Vec<u8>,
     respawned: Vec<u8>,
+    /// Frames of fade left. Infinite for a particle that is still alive.
+    fade: Vec<f32>,
+    birth: Vec<u32>,
     count: usize,
+    alive_count: usize,
+    next_birth: u32,
     limit: usize,
-    recycle_cursor: usize,
 
     width: f32,
     height: f32,
@@ -180,6 +191,8 @@ impl World {
         self.acceleration_y.resize(required, 0.0);
         self.color.resize(required, 0);
         self.respawned.resize(required, 0);
+        self.fade.resize(required, f32::INFINITY);
+        self.birth.resize(required, 0);
         self.body_next.resize(required, -1);
         self.grid_items.resize(required, 0);
         self.snapshot.resize(
@@ -197,19 +210,81 @@ impl World {
         self.grid_cursor.resize(table, 0);
     }
 
-    fn set_limit(&mut self, limit: usize) {
-        self.limit = limit;
-
-        if self.count > limit {
-            self.count = limit;
+    /// Retiring particles stay in the arrays, so a slot can outlive its own
+    /// removal; the swapped-in occupant is flagged so the host stops
+    /// interpolating it from the previous snapshot.
+    fn remove_particle(&mut self, index: usize) {
+        if self.fade[index].is_infinite() {
+            self.alive_count -= 1;
         }
 
-        self.ensure_capacity(limit.max(1));
-        self.recycle_cursor = if limit == 0 {
-            0
-        } else {
-            self.recycle_cursor % limit
-        };
+        self.count -= 1;
+
+        let last = self.count;
+
+        if index == last {
+            return;
+        }
+
+        self.x[index] = self.x[last];
+        self.y[index] = self.y[last];
+        self.velocity_x[index] = self.velocity_x[last];
+        self.velocity_y[index] = self.velocity_y[last];
+        self.acceleration_x[index] = self.acceleration_x[last];
+        self.acceleration_y[index] = self.acceleration_y[last];
+        self.color[index] = self.color[last];
+        self.fade[index] = self.fade[last];
+        self.birth[index] = self.birth[last];
+        self.respawned[index] = 1;
+    }
+
+    fn retire_oldest_alive(&mut self) {
+        let mut oldest = usize::MAX;
+        let mut oldest_birth = u32::MAX;
+
+        for index in 0..self.count {
+            if self.fade[index].is_finite() || self.birth[index] >= oldest_birth {
+                continue;
+            }
+
+            oldest_birth = self.birth[index];
+            oldest = index;
+        }
+
+        if oldest != usize::MAX {
+            self.fade[oldest] = RETIRE_FADE_FRAMES;
+            self.alive_count -= 1;
+        }
+    }
+
+    /// All fades start equal, so the least remaining is the longest running.
+    fn drop_longest_fade(&mut self) {
+        let mut oldest = usize::MAX;
+        let mut least = f32::INFINITY;
+
+        for index in 0..self.count {
+            if self.fade[index] < least {
+                least = self.fade[index];
+                oldest = index;
+            }
+        }
+
+        if oldest != usize::MAX {
+            self.remove_particle(oldest);
+        }
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        self.ensure_capacity(limit + MAX_RETIRING);
+
+        while self.alive_count > limit {
+            self.retire_oldest_alive();
+        }
+
+        while self.count - self.alive_count > MAX_RETIRING {
+            self.drop_longest_fade();
+        }
     }
 
     // ---- broad phase -------------------------------------------------------
@@ -306,41 +381,6 @@ impl World {
 
                         self.resolve_pair(index, other);
                     }
-                }
-            }
-        }
-    }
-
-    fn solve_walls(&mut self) {
-        let max_x = (self.width - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
-        let max_y = (self.height - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
-
-        for index in 0..self.count {
-            if self.x[index] < PARTICLE_RADIUS {
-                self.x[index] = PARTICLE_RADIUS;
-
-                if self.velocity_x[index] < 0.0 {
-                    self.velocity_x[index] = -self.velocity_x[index];
-                }
-            } else if self.x[index] > max_x {
-                self.x[index] = max_x;
-
-                if self.velocity_x[index] > 0.0 {
-                    self.velocity_x[index] = -self.velocity_x[index];
-                }
-            }
-
-            if self.y[index] < PARTICLE_RADIUS {
-                self.y[index] = PARTICLE_RADIUS;
-
-                if self.velocity_y[index] < 0.0 {
-                    self.velocity_y[index] = -self.velocity_y[index];
-                }
-            } else if self.y[index] > max_y {
-                self.y[index] = max_y;
-
-                if self.velocity_y[index] > 0.0 {
-                    self.velocity_y[index] = -self.velocity_y[index];
                 }
             }
         }
@@ -735,7 +775,7 @@ impl World {
 
     // ---- emission ----------------------------------------------------------
 
-    fn is_spawn_position_free(&self, x: f32, y: f32, excluded: usize) -> bool {
+    fn is_spawn_position_free(&self, x: f32, y: f32) -> bool {
         for slot in 0..self.batch_x.len() {
             let offset_x = self.batch_x[slot] - x;
             let offset_y = self.batch_y[slot] - y;
@@ -757,7 +797,7 @@ impl World {
                 for slot in start..end {
                     let other = self.grid_items[slot] as usize;
 
-                    if other == excluded || other >= self.count {
+                    if other >= self.count {
                         continue;
                     }
 
@@ -779,13 +819,6 @@ impl World {
             return;
         }
 
-        let is_recycling = self.count >= self.limit;
-        // Resolved first so the search can ignore the slot about to move away.
-        let excluded = if is_recycling {
-            self.recycle_cursor
-        } else {
-            usize::MAX
-        };
         let max_x = (self.width - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
         let max_y = (self.height - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
         let mut position_x = 0.0;
@@ -806,7 +839,7 @@ impl World {
                 max_y,
             );
 
-            if self.is_spawn_position_free(position_x, position_y, excluded) {
+            if self.is_spawn_position_free(position_x, position_y) {
                 has_placement = true;
                 break;
             }
@@ -817,28 +850,34 @@ impl World {
             return;
         }
 
+        // The particle being replaced keeps its slot and carries on colliding
+        // until its fade runs out, so the newcomer always needs a fresh one.
+        if self.alive_count >= self.limit {
+            self.retire_oldest_alive();
+        }
+
+        while self.count - self.alive_count > MAX_RETIRING {
+            self.drop_longest_fade();
+        }
+
         let spread = self.random_between(-0.34, 0.34);
         let speed = (pointer_speed + self.random_between(2.2, 4.8))
             * self.random_between(0.72, 1.12)
             * EMISSION_VELOCITY_SCALE;
-        let index = if is_recycling {
-            let slot = self.recycle_cursor;
+        let index = self.count;
 
-            self.recycle_cursor = (self.recycle_cursor + 1) % self.limit;
-            slot
-        } else {
-            let slot = self.count;
-
-            self.count += 1;
-            slot
-        };
-
+        self.ensure_capacity(index + 1);
+        self.count += 1;
+        self.alive_count += 1;
         self.x[index] = position_x;
         self.y[index] = position_y;
         self.velocity_x[index] = (heading + spread).cos() * speed;
         self.velocity_y[index] = (heading + spread).sin() * speed;
         self.color[index] = ((hue / HUE_STEP).floor() as u32 % HUE_COUNT as u32) as u8;
         self.respawned[index] = 1;
+        self.fade[index] = f32::INFINITY;
+        self.birth[index] = self.next_birth;
+        self.next_birth = self.next_birth.wrapping_add(1);
         self.batch_x.push(position_x);
         self.batch_y.push(position_y);
     }
@@ -897,6 +936,48 @@ impl World {
 
     // ---- stepping ----------------------------------------------------------
 
+    fn integrate(&mut self, retained: f32) {
+        for index in 0..self.count {
+            self.velocity_x[index] =
+                (self.velocity_x[index] + self.acceleration_x[index] * SUBSTEP_DT) * retained;
+            self.velocity_y[index] =
+                (self.velocity_y[index] + self.acceleration_y[index] * SUBSTEP_DT) * retained;
+            self.x[index] += self.velocity_x[index] * SUBSTEP_DT;
+            self.y[index] += self.velocity_y[index] * SUBSTEP_DT;
+        }
+    }
+
+    fn solve_walls(&mut self) {
+        let max_x = (self.width - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
+        let max_y = (self.height - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
+
+        for index in 0..self.count {
+            if self.x[index] < PARTICLE_RADIUS {
+                self.x[index] = PARTICLE_RADIUS;
+                if self.velocity_x[index] < 0.0 {
+                    self.velocity_x[index] = -self.velocity_x[index];
+                }
+            } else if self.x[index] > max_x {
+                self.x[index] = max_x;
+                if self.velocity_x[index] > 0.0 {
+                    self.velocity_x[index] = -self.velocity_x[index];
+                }
+            }
+
+            if self.y[index] < PARTICLE_RADIUS {
+                self.y[index] = PARTICLE_RADIUS;
+                if self.velocity_y[index] < 0.0 {
+                    self.velocity_y[index] = -self.velocity_y[index];
+                }
+            } else if self.y[index] > max_y {
+                self.y[index] = max_y;
+                if self.velocity_y[index] > 0.0 {
+                    self.velocity_y[index] = -self.velocity_y[index];
+                }
+            }
+        }
+    }
+
     fn step(&mut self) {
         let air_resistance = MAX_AIR_RESISTANCE * (self.air_percent / MAX_CONTROL_PERCENT);
         let retained = (1.0 - air_resistance).max(0.0).powf(SUBSTEP_DT);
@@ -914,22 +995,36 @@ impl World {
                 self.accumulate_field();
             }
 
-            for index in 0..self.count {
-                self.velocity_x[index] =
-                    (self.velocity_x[index] + self.acceleration_x[index] * SUBSTEP_DT) * retained;
-                self.velocity_y[index] =
-                    (self.velocity_y[index] + self.acceleration_y[index] * SUBSTEP_DT) * retained;
-                self.x[index] += self.velocity_x[index] * SUBSTEP_DT;
-                self.y[index] += self.velocity_y[index] * SUBSTEP_DT;
-            }
-
+            self.integrate(retained);
             self.solve_contacts();
             self.solve_walls();
         }
 
         self.batch_x.clear();
         self.batch_y.clear();
+        self.expire_fades();
         self.step_index = self.step_index.wrapping_add(1);
+    }
+
+    fn expire_fades(&mut self) {
+        let mut index = 0;
+
+        while index < self.count {
+            if self.fade[index].is_infinite() {
+                index += 1;
+                continue;
+            }
+
+            self.fade[index] -= 1.0;
+
+            if self.fade[index] > 0.0 {
+                index += 1;
+                continue;
+            }
+
+            // The swap drops a new particle into this slot, so hold position.
+            self.remove_particle(index);
+        }
     }
 
     fn write_snapshot(&mut self) {
@@ -963,11 +1058,21 @@ impl World {
             self.snapshot[speeds + index * 4..speeds + index * 4 + 4]
                 .copy_from_slice(&speed.to_le_bytes());
             self.snapshot[colors + index] = self.color[index];
-            self.snapshot[particle_flags + index] = if self.respawned[index] != 0 {
+
+            let fade = self.fade[index];
+            let level = if fade.is_infinite() {
+                RETIRE_FADE_LEVELS
+            } else {
+                (fade / RETIRE_FADE_FRAMES * RETIRE_FADE_LEVELS).round()
+            };
+            let respawned = if self.respawned[index] != 0 {
                 PARTICLE_FLAG_RESPAWNED
             } else {
                 0
             };
+
+            self.snapshot[particle_flags + index] =
+                respawned | ((level as u8) << PARTICLE_FADE_SHIFT);
             self.respawned[index] = 0;
         }
     }
