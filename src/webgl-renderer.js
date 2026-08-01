@@ -3,7 +3,7 @@
  * offscreen target so the motion trail survives between frames.
  */
 
-/** x, y of the streak tail and head, then the colour. */
+/** x, y of the streak tail and head, then hue, lightness and fade. */
 export const INSTANCE_FLOATS = 7
 
 const PARTICLE_VERTEX_SHADER = `#version 300 es
@@ -11,7 +11,7 @@ precision highp float;
 
 layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 segment;
-layout(location = 2) in vec3 tint;
+layout(location = 2) in vec3 shade;
 
 uniform vec2 viewport;
 uniform float radius;
@@ -22,10 +22,34 @@ flat out vec2 tail;
 flat out vec2 head;
 flat out vec3 color;
 
+/** Saturation is always full, so only hue and lightness vary. */
+vec3 hueToRgb(float hue, float lightness) {
+  float chroma = 1.0 - abs(2.0 * lightness - 1.0);
+  float sector = fract(hue) * 6.0;
+  float second = chroma * (1.0 - abs(mod(sector, 2.0) - 1.0));
+  vec3 wheel;
+
+  if (sector < 1.0) {
+    wheel = vec3(chroma, second, 0.0);
+  } else if (sector < 2.0) {
+    wheel = vec3(second, chroma, 0.0);
+  } else if (sector < 3.0) {
+    wheel = vec3(0.0, chroma, second);
+  } else if (sector < 4.0) {
+    wheel = vec3(0.0, second, chroma);
+  } else if (sector < 5.0) {
+    wheel = vec3(second, 0.0, chroma);
+  } else {
+    wheel = vec3(chroma, 0.0, second);
+  }
+
+  return wheel + (lightness - chroma * 0.5);
+}
+
 void main() {
   tail = segment.xy;
   head = segment.zw;
-  color = tint;
+  color = hueToRgb(shade.x, shade.y) * shade.z;
 
   vec2 axis = head - tail;
   float span = length(axis);

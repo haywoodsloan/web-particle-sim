@@ -21,8 +21,6 @@ const PARTICLE_GRAVITY_SOFTENING: f32 = 4.0;
 const POINTER_HOLE_RADIUS: f32 = 375.0;
 const POINTER_HOLE_MASS: f32 = 288.0;
 const POINTER_HOLE_SOFTENING: f32 = 90.0;
-const HUE_COUNT: f32 = 18.0;
-const HUE_STEP: f32 = 360.0 / HUE_COUNT;
 const PARTICLE_RADIUS: f32 = 1.8;
 const SNAPSHOT_HEADER_BYTES: usize = 16;
 const SNAPSHOT_BYTES_PER_PARTICLE: usize = 14;
@@ -873,7 +871,8 @@ impl World {
         self.y[index] = position_y;
         self.velocity_x[index] = (heading + spread).cos() * speed;
         self.velocity_y[index] = (heading + spread).sin() * speed;
-        self.color[index] = ((hue / HUE_STEP).floor() as u32 % HUE_COUNT as u32) as u8;
+        // Hue spans the whole byte, so the host can shade a continuous wheel.
+        self.color[index] = (hue / 360.0 * 256.0) as u8;
         self.respawned[index] = 1;
         self.fade[index] = f32::INFINITY;
         self.birth[index] = self.next_birth;

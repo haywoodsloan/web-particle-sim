@@ -3,9 +3,6 @@
 export const FRAME_DURATION = 1000 / 60
 export const PARTICLE_RADIUS = 1.8
 export const FULL_BRIGHTNESS_SPEED = 6
-export const HUE_COUNT = 18
-/** Degrees per colour index, so the palette spans the wheel exactly once. */
-export const HUE_STEP = 360 / HUE_COUNT
 
 // Control surface, owned entirely by the main thread.
 export const MAX_CONTROL_PERCENT = 100

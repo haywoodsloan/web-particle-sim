@@ -5,8 +5,6 @@ import {
   DEFAULT_PARTICLE_LIMIT,
   FRAME_DURATION,
   FULL_BRIGHTNESS_SPEED,
-  HUE_COUNT,
-  HUE_STEP,
   MAX_CONTROL_PERCENT,
   MAX_RETIRING_PARTICLES,
   MESSAGE_AIR_RESISTANCE,
@@ -35,8 +33,12 @@ import {
 import { INSTANCE_FLOATS, createRenderer } from './webgl-renderer.js'
 
 const CONTROL_STEP = 10
-const BRIGHTNESS_LEVELS = 8
 const MAX_PIXEL_RATIO = 2
+/** Lightness the speed ramp spans, unchanged from the old 8 step palette. */
+const MIN_LIGHTNESS = 0.25
+const MAX_LIGHTNESS = 0.62
+/** Hue is delivered as a byte spanning the wheel. */
+const HUE_RESOLUTION = 256
 /** Trail decay constant; keeps the veil independent of frame rate. */
 const TRAIL_TAU = 28
 /** Beyond this a streak is a teleport, not motion. */
@@ -45,42 +47,10 @@ const SNAPSHOT_POOL_SIZE = 4
 const SNAPSHOT_INTERVAL_SMOOTHING = 0.15
 const MAX_INTERPOLATION_SPAN = 250
 
-/** Fully saturated hue to linear-ish rgb, matching the old hsl() palette. */
-function hueToChannels(hue, lightness) {
-  const chroma = (1 - Math.abs(2 * lightness - 1)) * 1
-  const sector = hue / 60
-  const second = chroma * (1 - Math.abs((sector % 2) - 1))
-  const base = lightness - chroma / 2
-  const wheel = [
-    [chroma, second, 0],
-    [second, chroma, 0],
-    [0, chroma, second],
-    [0, second, chroma],
-    [second, 0, chroma],
-    [chroma, 0, second],
-  ][Math.floor(sector) % 6]
-
-  return wheel.map((channel) => channel + base)
-}
-
-const PARTICLE_COLORS = new Float32Array(HUE_COUNT * BRIGHTNESS_LEVELS * 3)
-
-for (let bucket = 0; bucket < HUE_COUNT * BRIGHTNESS_LEVELS; bucket += 1) {
-  const colorIndex = Math.floor(bucket / BRIGHTNESS_LEVELS)
-  const brightnessIndex = bucket % BRIGHTNESS_LEVELS
-  const lightness = (25 + (37 * brightnessIndex) / (BRIGHTNESS_LEVELS - 1)) / 100
-
-  PARTICLE_COLORS.set(
-    hueToChannels(colorIndex * HUE_STEP, lightness),
-    bucket * 3,
-  )
-}
-
-const getBrightnessIndex = (speed) =>
-  Math.round(
-    Math.sqrt(clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1)) *
-      (BRIGHTNESS_LEVELS - 1),
-  )
+const getLightness = (speed) =>
+  MIN_LIGHTNESS +
+  (MAX_LIGHTNESS - MIN_LIGHTNESS) *
+    Math.sqrt(clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1))
 
 document.querySelector('#app').innerHTML = `
   <canvas
@@ -426,16 +396,10 @@ function renderParticles(time, veilAlpha) {
       renderY[index] = y
     }
 
-    // Speed picks the palette entry, then the fade scales it continuously to
-    // black. Bucket 0 is still 25% lightness, so quantising the fade too would
-    // make a retiring particle vanish from a visible dot.
+    // Speed drives lightness and the fade scales the result to black, both
+    // continuous now that colour is a per instance shader attribute.
     const fade =
       (views.flags[index] >> PARTICLE_FADE_SHIFT) & PARTICLE_FADE_LEVELS
-    const fadeScale = fade / PARTICLE_FADE_LEVELS
-    const palette =
-      (views.colors[index] * BRIGHTNESS_LEVELS +
-        getBrightnessIndex(views.speeds[index])) *
-      3
     const offset = index * INSTANCE_FLOATS
 
     // The streak spans motion since the last drawn frame, so it stays the
@@ -444,9 +408,9 @@ function renderParticles(time, veilAlpha) {
     instanceData[offset + 1] = renderY[index]
     instanceData[offset + 2] = x
     instanceData[offset + 3] = y
-    instanceData[offset + 4] = PARTICLE_COLORS[palette] * fadeScale
-    instanceData[offset + 5] = PARTICLE_COLORS[palette + 1] * fadeScale
-    instanceData[offset + 6] = PARTICLE_COLORS[palette + 2] * fadeScale
+    instanceData[offset + 4] = views.colors[index] / HUE_RESOLUTION
+    instanceData[offset + 5] = getLightness(views.speeds[index])
+    instanceData[offset + 6] = fade / PARTICLE_FADE_LEVELS
     renderX[index] = x
     renderY[index] = y
   }
