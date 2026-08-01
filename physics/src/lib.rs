@@ -982,6 +982,10 @@ impl World {
         let air_resistance = MAX_AIR_RESISTANCE * (self.air_percent / MAX_CONTROL_PERCENT);
         let retained = (1.0 - air_resistance).max(0.0).powf(SUBSTEP_DT);
 
+        // Ahead of the substeps so the last grid built this step still matches
+        // the array, which the spawn overlap check relies on until the next one.
+        self.expire_fades();
+
         for substep in 0..PHYSICS_SUBSTEPS {
             // Sources barely shift within a frame, so one tree serves the whole
             // step and later substeps replay the sets recorded against it.
@@ -1002,7 +1006,6 @@ impl World {
 
         self.batch_x.clear();
         self.batch_y.clear();
-        self.expire_fades();
         self.step_index = self.step_index.wrapping_add(1);
     }
 
@@ -1063,7 +1066,9 @@ impl World {
             let level = if fade.is_infinite() {
                 RETIRE_FADE_LEVELS
             } else {
-                (fade / RETIRE_FADE_FRAMES * RETIRE_FADE_LEVELS).round()
+                // Floors so the final frame before removal lands on zero and
+                // the particle is already black when it disappears.
+                (fade / RETIRE_FADE_FRAMES * RETIRE_FADE_LEVELS).floor()
             };
             let respawned = if self.respawned[index] != 0 {
                 PARTICLE_FLAG_RESPAWNED

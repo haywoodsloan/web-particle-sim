@@ -426,15 +426,16 @@ function renderParticles(time, veilAlpha) {
       renderY[index] = y
     }
 
-    // A retiring particle keeps moving and simply dims, so its fade scales the
-    // brightness its speed earned.
+    // Speed picks the palette entry, then the fade scales it continuously to
+    // black. Bucket 0 is still 25% lightness, so quantising the fade too would
+    // make a retiring particle vanish from a visible dot.
     const fade =
       (views.flags[index] >> PARTICLE_FADE_SHIFT) & PARTICLE_FADE_LEVELS
-    const brightnessIndex = Math.round(
-      (getBrightnessIndex(views.speeds[index]) * fade) / PARTICLE_FADE_LEVELS,
-    )
+    const fadeScale = fade / PARTICLE_FADE_LEVELS
     const palette =
-      (views.colors[index] * BRIGHTNESS_LEVELS + brightnessIndex) * 3
+      (views.colors[index] * BRIGHTNESS_LEVELS +
+        getBrightnessIndex(views.speeds[index])) *
+      3
     const offset = index * INSTANCE_FLOATS
 
     // The streak spans motion since the last drawn frame, so it stays the
@@ -443,9 +444,9 @@ function renderParticles(time, veilAlpha) {
     instanceData[offset + 1] = renderY[index]
     instanceData[offset + 2] = x
     instanceData[offset + 3] = y
-    instanceData[offset + 4] = PARTICLE_COLORS[palette]
-    instanceData[offset + 5] = PARTICLE_COLORS[palette + 1]
-    instanceData[offset + 6] = PARTICLE_COLORS[palette + 2]
+    instanceData[offset + 4] = PARTICLE_COLORS[palette] * fadeScale
+    instanceData[offset + 5] = PARTICLE_COLORS[palette + 1] * fadeScale
+    instanceData[offset + 6] = PARTICLE_COLORS[palette + 2] * fadeScale
     renderX[index] = x
     renderY[index] = y
   }
