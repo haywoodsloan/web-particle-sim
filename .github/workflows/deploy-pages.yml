@@ -28,11 +28,28 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up Rust
+        # rust-toolchain.toml pins the channel and the wasm target.
+        run: rustup show active-toolchain
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            physics/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', 'physics/Cargo.toml', 'physics/src/**') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Lint
+        run: npm run lint
 
       - name: Build site
         run: npm run build

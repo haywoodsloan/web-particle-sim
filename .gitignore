@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Rust physics engine build output
+physics/target
+src/physics.wasm
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

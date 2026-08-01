@@ -331,12 +331,7 @@ function resetPointer(event) {
   pointer.x = event?.clientX ?? null
   pointer.y = event?.clientY ?? null
   updatePointerHoleIndicator()
-  sendToWorker({
-    type: MESSAGE_POINTER_RESET,
-    x: pointer.x,
-    y: pointer.y,
-    timeStamp: event?.timeStamp ?? null,
-  })
+  sendToWorker({ type: MESSAGE_POINTER_RESET })
 }
 
 function ensureRenderCapacity(count) {
@@ -525,7 +520,6 @@ const initialSnapshotBuffers = Array.from(
   () => new ArrayBuffer(getSnapshotByteLength(DEFAULT_PARTICLE_LIMIT)),
 )
 
-canvas.dataset.renderQuality = 'baseline'
 configureCanvas()
 document
   .querySelector('#controls-dismiss')
@@ -540,6 +534,7 @@ sendToWorker(
     airResistancePercent,
     particleLimit,
     emissionEnabled: isParticleEmissionEnabled,
+    hidden: document.hidden,
     buffers: initialSnapshotBuffers,
   },
   initialSnapshotBuffers,
