@@ -34,8 +34,9 @@ import { INSTANCE_FLOATS, createRenderer } from './webgl-renderer.js'
 
 const CONTROL_STEP = 10
 const MAX_PIXEL_RATIO = 2
-/** Lightness the speed ramp spans, unchanged from the old 8 step palette. */
-const MIN_LIGHTNESS = 0.25
+/** Lightness the speed ramp spans. The floor carries the tone map's shoulder,
+ *  which pulls the top end down and would otherwise leave slow particles dim. */
+const MIN_LIGHTNESS = 0.32
 const MAX_LIGHTNESS = 0.62
 /** Hue is delivered as a byte spanning the wheel. */
 const HUE_RESOLUTION = 256
@@ -53,10 +54,6 @@ const getLightness = (speed) =>
   MIN_LIGHTNESS +
   (MAX_LIGHTNESS - MIN_LIGHTNESS) *
     Math.sqrt(clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1))
-
-/** Squared rather than the lightness ramp's root, so a drifting particle keeps
- *  a clean edge and only the quick ones trail a halo. */
-const getGlow = (speed) => clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1) ** 2
 
 document.querySelector('#app').innerHTML = `
   <canvas
@@ -446,7 +443,6 @@ function renderParticles(time, veilAlpha) {
     instanceData[offset + 4] = views.colors[index] / HUE_RESOLUTION
     instanceData[offset + 5] = getLightness(views.speeds[index])
     instanceData[offset + 6] = fade / PARTICLE_FADE_LEVELS
-    instanceData[offset + 7] = getGlow(views.speeds[index])
     renderX[index] = x
     renderY[index] = y
   }

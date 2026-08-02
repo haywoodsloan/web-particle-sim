@@ -3,21 +3,22 @@
  * offscreen target so the motion trail survives between frames.
  */
 
-/** x, y of the streak tail and head, then hue, lightness, fade and glow. */
-export const INSTANCE_FLOATS = 8
+/** x, y of the streak tail and head, then hue, lightness and fade. */
+export const INSTANCE_FLOATS = 7
 
-/** How far the halo reaches past the particle edge, in radii. */
-const GLOW_REACH = 3.5
+/** How far the halo reaches past the particle edge, in radii. Widening this
+ *  raises how much neighbouring emitters overlap without touching the peak. */
+const GLOW_REACH = 5.5
 /** Peak halo brightness, at full speed. Trails accumulate the halo across
  *  frames, so this stays well under one. */
-const GLOW_STRENGTH = 0.15
+const GLOW_STRENGTH = 0.1
 
 const PARTICLE_VERTEX_SHADER = `#version 300 es
 precision highp float;
 
 layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 segment;
-layout(location = 2) in vec4 shade;
+layout(location = 2) in vec3 shade;
 
 uniform vec2 viewport;
 uniform float radius;
@@ -29,7 +30,6 @@ out vec2 pixel;
 flat out vec2 tail;
 flat out vec2 head;
 flat out vec3 color;
-flat out float glowScale;
 
 /** Saturation is always full, so only hue and lightness vary. */
 vec3 hueToRgb(float hue, float lightness) {
@@ -59,7 +59,6 @@ void main() {
   tail = segment.xy;
   head = segment.zw;
   color = hueToRgb(shade.x, shade.y) * shade.z;
-  glowScale = shade.w;
 
   vec2 axis = head - tail;
   float span = length(axis);
@@ -89,7 +88,6 @@ in vec2 pixel;
 flat in vec2 tail;
 flat in vec2 head;
 flat in vec3 color;
-flat in float glowScale;
 
 uniform float radius;
 uniform float feather;
@@ -120,7 +118,7 @@ void main() {
   // Squared for a softer knee, and compactly supported so the quad edge never
   // shows as a seam.
   float falloff = 1.0 - smoothstep(radius, radius + glow, distance);
-  float halo = falloff * falloff * glowStrength * glowScale;
+  float halo = falloff * falloff * glowStrength;
 
   if (halo <= 0.0) {
     discard;
@@ -169,20 +167,24 @@ precision highp float;
 in vec2 uv;
 
 uniform sampler2D trail;
+uniform sampler2D light;
 
 out vec4 fragment;
 
 /** Emitters accumulate past full brightness, so the top end is rolled off
- *  instead of clipped. Linear below the knee keeps a lone particle's colour. */
+ *  instead of clipped. Linear below the knee keeps a lone particle's colour,
+ *  and the reciprocal shoulder keeps piled-up light separable far longer than
+ *  an exponential one, which saturates almost immediately. */
 vec3 toneMap(vec3 light) {
-  const float knee = 0.8;
+  const float knee = 0.75;
+  const float shoulder = 1.0 - knee;
   vec3 over = max(light - knee, vec3(0.0));
 
-  return min(light, vec3(knee)) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
+  return min(light, vec3(knee)) + shoulder * over / (over + shoulder);
 }
 
 void main() {
-  fragment = vec4(toneMap(texture(trail, uv).rgb), 1.0);
+  fragment = vec4(toneMap(texture(trail, uv).rgb + texture(light, uv).rgb), 1.0);
 }`
 
 function compile(gl, type, source) {
@@ -288,7 +290,7 @@ export function createRenderer(canvas, radius) {
   gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0)
   gl.vertexAttribDivisor(1, 1)
   gl.enableVertexAttribArray(2)
-  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 16)
+  gl.vertexAttribPointer(2, 3, gl.FLOAT, false, stride, 16)
   gl.vertexAttribDivisor(2, 1)
 
   const veilArray = gl.createVertexArray()
@@ -300,9 +302,15 @@ export function createRenderer(canvas, radius) {
   gl.bindVertexArray(null)
 
   const trailTarget = gl.createFramebuffer()
+  const lightTarget = gl.createFramebuffer()
 
   let trailTexture = null
+  let lightTexture = null
   let instanceCapacity = 0
+
+  gl.useProgram(copyProgram)
+  gl.uniform1i(gl.getUniformLocation(copyProgram, 'trail'), 0)
+  gl.uniform1i(gl.getUniformLocation(copyProgram, 'light'), 1)
 
   gl.disable(gl.DEPTH_TEST)
   gl.enable(gl.BLEND)
@@ -313,35 +321,47 @@ export function createRenderer(canvas, radius) {
     resize(width, height, pixelRatio) {
       if (trailTexture) {
         gl.deleteTexture(trailTexture)
+        gl.deleteTexture(lightTexture)
       }
 
-      trailTexture = gl.createTexture()
-      gl.bindTexture(gl.TEXTURE_2D, trailTexture)
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        trail.internalFormat,
-        canvas.width,
-        canvas.height,
-        0,
-        trail.format,
-        trail.type,
-        null,
-      )
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, trailTarget)
-      gl.framebufferTexture2D(
-        gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
-        gl.TEXTURE_2D,
-        trailTexture,
-        0,
-      )
-      gl.clearColor(0, 0, 0, 1)
-      gl.clear(gl.COLOR_BUFFER_BIT)
+      // Unit 0 holds the persistent trail, unit 1 this frame's light. Nothing
+      // else samples a texture, so both stay bound.
+      const attach = (target, unit) => {
+        const texture = gl.createTexture()
+
+        gl.activeTexture(gl.TEXTURE0 + unit)
+        gl.bindTexture(gl.TEXTURE_2D, texture)
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          trail.internalFormat,
+          canvas.width,
+          canvas.height,
+          0,
+          trail.format,
+          trail.type,
+          null,
+        )
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+        gl.bindFramebuffer(gl.FRAMEBUFFER, target)
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          texture,
+          0,
+        )
+        gl.clearColor(0, 0, 0, 1)
+        gl.clear(gl.COLOR_BUFFER_BIT)
+
+        return texture
+      }
+
+      trailTexture = attach(trailTarget, 0)
+      lightTexture = attach(lightTarget, 1)
       gl.bindFramebuffer(gl.FRAMEBUFFER, null)
 
       gl.useProgram(particleProgram)
@@ -384,10 +404,17 @@ export function createRenderer(canvas, radius) {
           instanceCount * INSTANCE_FLOATS,
         )
         gl.useProgram(particleProgram)
-        // Cores first, so the halos that follow add on top of neighbours
-        // instead of being covered by them.
         gl.uniform1f(particleUniforms.haloPass, 0)
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount)
+      }
+
+      // Light is rebuilt from scratch every frame. Accumulating it into the
+      // trail instead would let a resting particle pile its own glow up to
+      // roughly 1/veilAlpha, making slow particles the brightest.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, lightTarget)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+
+      if (instanceCount > 0) {
         gl.uniform1f(particleUniforms.haloPass, 1)
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount)
       }
@@ -397,7 +424,6 @@ export function createRenderer(canvas, radius) {
       gl.viewport(0, 0, canvas.width, canvas.height)
       gl.disable(gl.BLEND)
       gl.useProgram(copyProgram)
-      gl.bindTexture(gl.TEXTURE_2D, trailTexture)
       gl.bindVertexArray(veilArray)
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
       gl.bindVertexArray(null)
