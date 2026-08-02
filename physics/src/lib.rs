@@ -53,6 +53,11 @@ const INVERSE_CELL_SIZE: f32 = 1.0 / MAX_CONTACT_DIAMETER;
 /// Overlap is removed positionally so that separating never adds energy.
 const POSITION_CORRECTION: f32 = 0.8;
 const PARTICLE_DENSITY: f32 = 9.8e-5;
+/// Stokes drag on a disc decelerates it by radius / mass, so a small light
+/// particle brakes far harder than a big dense one. Normalised against a mid
+/// sized particle so the air control keeps the range it always had.
+const DRAG_REFERENCE: f32 =
+    1.0 / (PARTICLE_DENSITY * core::f32::consts::PI * MEAN_PARTICLE_RADIUS);
 /// Same size need not mean same mass, so density varies too. It costs nothing
 /// in the broad phase, but a wider mass spread still flings light particles
 /// faster, which drives the substep rate.
@@ -112,6 +117,10 @@ struct World {
     acceleration_y: Vec<f32>,
     radius: Vec<f32>,
     mass: Vec<f32>,
+    /// How hard the medium bites this particle, relative to a mid sized one.
+    drag_scale: Vec<f32>,
+    /// Velocity kept per substep, worked out once a step from the drag scale.
+    retained: Vec<f32>,
     color: Vec<u8>,
     respawned: Vec<u8>,
     /// Frames of fade left. Infinite for a particle that is still alive.
@@ -216,6 +225,8 @@ impl World {
         self.acceleration_y.resize(required, 0.0);
         self.radius.resize(required, MIN_PARTICLE_RADIUS);
         self.mass.resize(required, mass_for(MIN_PARTICLE_RADIUS, 1.0));
+        self.drag_scale.resize(required, 1.0);
+        self.retained.resize(required, 1.0);
         self.color.resize(required, 0);
         self.respawned.resize(required, 0);
         self.fade.resize(required, f32::INFINITY);
@@ -261,6 +272,7 @@ impl World {
         self.acceleration_y[index] = self.acceleration_y[last];
         self.radius[index] = self.radius[last];
         self.mass[index] = self.mass[last];
+        self.drag_scale[index] = self.drag_scale[last];
         self.color[index] = self.color[last];
         self.fade[index] = self.fade[last];
         self.birth[index] = self.birth[last];
@@ -944,6 +956,7 @@ impl World {
             radius,
             self.random_between(MIN_DENSITY_SCALE, MAX_DENSITY_SCALE),
         );
+        self.drag_scale[index] = radius / self.mass[index] / DRAG_REFERENCE;
         self.velocity_x[index] = (heading + spread).cos() * speed;
         self.velocity_y[index] = (heading + spread).sin() * speed;
         // Hue spans the whole byte, so the host can shade a continuous wheel.
@@ -1011,8 +1024,10 @@ impl World {
 
     // ---- stepping ----------------------------------------------------------
 
-    fn integrate(&mut self, retained: f32, dt: f32) {
+    fn integrate(&mut self, dt: f32) {
         for index in 0..self.count {
+            let retained = self.retained[index];
+
             self.velocity_x[index] =
                 (self.velocity_x[index] + self.acceleration_x[index] * dt) * retained;
             self.velocity_y[index] =
@@ -1084,7 +1099,12 @@ impl World {
         let air_resistance = MAX_AIR_RESISTANCE * (self.air_percent / MAX_CONTROL_PERCENT);
         let substeps = self.choose_substeps();
         let dt = 1.0 / substeps as f32;
-        let retained = (1.0 - air_resistance).max(0.0).powf(dt);
+        // With no air this is ln(1) = 0, so every particle keeps exactly 1.
+        let decay = (1.0 - air_resistance).max(0.0).ln() * dt;
+
+        for index in 0..self.count {
+            self.retained[index] = (decay * self.drag_scale[index]).exp();
+        }
 
         // Ahead of the substeps so the last grid built this step still matches
         // the array, which the spawn overlap check relies on until the next one.
@@ -1103,7 +1123,7 @@ impl World {
                 self.accumulate_field();
             }
 
-            self.integrate(retained, dt);
+            self.integrate(dt);
             self.solve_contacts();
             self.solve_walls();
         }
