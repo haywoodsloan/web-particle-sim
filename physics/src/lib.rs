@@ -1,9 +1,11 @@
 //! Particle solver for the rainbow field.
 //!
-//! Equal-mass frictionless discs only ever swap their normal velocity on
-//! contact, so collisions conserve momentum and kinetic energy exactly rather
-//! than approximately. Everything is stored as flat arrays inside the module's
-//! linear memory and the host reads a packed snapshot straight out of it.
+//! Discs vary in size and density, and contacts reverse both the normal and the
+//! tangential velocity of the contact patch, so collisions trade energy between
+//! motion and spin without ever losing any. Everything is stored as flat arrays
+//! inside the module's linear memory and the host reads a packed snapshot
+//! straight out of it.
+#![cfg_attr(target_feature = "atomics", feature(stdarch_wasm_atomic_wait))]
 
 use core::arch::wasm32::*;
 use core::cell::UnsafeCell;
@@ -168,18 +170,11 @@ struct World {
     tree_size: Vec<f64>,
     tree_parent: Vec<i32>,
     tree_node_count: usize,
-    tree_stack: Vec<i32>,
 
-    /// Which nodes and bodies each particle pulls on, recorded on the first
-    /// field evaluation of a frame and replayed by the rest of them. Node
-    /// sources are stored inline as parallel arrays, padded to four lanes, so
-    /// the replay is a flat SIMD stream instead of an unsupported gather.
-    node_source_x: Vec<f32>,
-    node_source_y: Vec<f32>,
-    node_source_mass: Vec<f32>,
-    node_start: Vec<u32>,
-    body_items: Vec<u32>,
-    body_start: Vec<u32>,
+    /// One record per worker slot. Slices are cut the same way for recording
+    /// and replay, so a slot always replays exactly what it recorded and the
+    /// result matches running the whole range on one thread.
+    records: Vec<Record>,
     has_interactions: bool,
 
     batch_x: Vec<f32>,
@@ -188,13 +183,41 @@ struct World {
     snapshot: Vec<u8>,
 }
 
+/// Which nodes and bodies each particle pulls on, recorded on the first field
+/// evaluation of a frame and replayed by the rest of them. Node sources are
+/// stored inline as parallel arrays, padded to four lanes, so the replay is a
+/// flat SIMD stream instead of an unsupported gather.
+struct Record {
+    node_source_x: Vec<f32>,
+    node_source_y: Vec<f32>,
+    node_source_mass: Vec<f32>,
+    node_start: Vec<u32>,
+    body_items: Vec<u32>,
+    body_start: Vec<u32>,
+    stack: Vec<i32>,
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self {
+            node_source_x: Vec::new(),
+            node_source_y: Vec::new(),
+            node_source_mass: Vec::new(),
+            node_start: Vec::new(),
+            body_items: Vec::new(),
+            body_start: Vec::new(),
+            // Depth-first over a 4-ary tree never needs more than 3 * depth + 1 slots.
+            stack: vec![0; 512],
+        }
+    }
+}
+
 impl World {
     fn new() -> Self {
         Self {
             discontinuous: true,
             rng: 0x2545_F491,
-            // Depth-first over a 4-ary tree never needs more than 3 * depth + 1 slots.
-            tree_stack: vec![0; 512],
+            records: vec![Record::default()],
             snapshot: vec![0; SNAPSHOT_HEADER_BYTES],
             ..Self::default()
         }
@@ -653,23 +676,23 @@ impl World {
         }
     }
 
-    fn accumulate_tree_gravity(&mut self, index: usize) -> (f32, f32) {
+    fn record_tree_gravity(&self, record: &mut Record, index: usize) -> (f32, f32) {
         let particle_x = self.x[index];
         let particle_y = self.y[index];
         let mut acceleration_x = 0.0f32;
         let mut acceleration_y = 0.0f32;
         let mut top = 0usize;
 
-        self.node_start.push(self.node_source_x.len() as u32);
-        self.body_start.push(self.body_items.len() as u32);
+        record.node_start.push(record.node_source_x.len() as u32);
+        record.body_start.push(record.body_items.len() as u32);
 
-        self.tree_stack[top] = 0;
+        record.stack[top] = 0;
         top += 1;
 
         while top > 0 {
             top -= 1;
 
-            let node = self.tree_stack[top] as usize;
+            let node = record.stack[top] as usize;
             let base = node * 4;
             let node_mass = self.tree_packed[base + 2];
 
@@ -684,7 +707,7 @@ impl World {
                     let slot = other as usize;
 
                     if slot != index {
-                        self.body_items.push(slot as u32);
+                        record.body_items.push(slot as u32);
 
                         let offset_x = self.x[slot] - particle_x;
                         let offset_y = self.y[slot] - particle_y;
@@ -710,9 +733,9 @@ impl World {
             let node_size = self.tree_packed[base + 3];
 
             if node_size * node_size < BARNES_HUT_THETA_SQUARED * distance_squared {
-                self.node_source_x.push(self.tree_packed[base]);
-                self.node_source_y.push(self.tree_packed[base + 1]);
-                self.node_source_mass.push(PARTICLE_GRAVITY * node_mass);
+                record.node_source_x.push(self.tree_packed[base]);
+                record.node_source_y.push(self.tree_packed[base + 1]);
+                record.node_source_mass.push(PARTICLE_GRAVITY * node_mass);
 
                 let softened =
                     distance_squared + PARTICLE_GRAVITY_SOFTENING * PARTICLE_GRAVITY_SOFTENING;
@@ -730,17 +753,17 @@ impl World {
                     break;
                 }
 
-                self.tree_stack[top] = child;
+                record.stack[top] = child;
                 top += 1;
             }
         }
 
         // Zero-mass padding contributes nothing, and squares off the run so the
         // replay never needs a scalar tail.
-        while !self.node_source_x.len().is_multiple_of(4) {
-            self.node_source_x.push(0.0);
-            self.node_source_y.push(0.0);
-            self.node_source_mass.push(0.0);
+        while !record.node_source_x.len().is_multiple_of(4) {
+            record.node_source_x.push(0.0);
+            record.node_source_y.push(0.0);
+            record.node_source_mass.push(0.0);
         }
 
         (acceleration_x, acceleration_y)
@@ -748,7 +771,7 @@ impl World {
 
     /// Sources shift far less within a frame than the particle being pulled, so
     /// the acceptance set is reused while the forces are recomputed in full.
-    fn replay_tree_gravity(&self, index: usize) -> (f32, f32) {
+    fn replay_tree_gravity(&self, record: &Record, local: usize, index: usize) -> (f32, f32) {
         let particle_x = self.x[index];
         let particle_y = self.y[index];
         let softening = PARTICLE_GRAVITY_SOFTENING * PARTICLE_GRAVITY_SOFTENING;
@@ -757,14 +780,14 @@ impl World {
         let splat_softening = f32x4_splat(softening);
         let mut lanes_x = f32x4_splat(0.0);
         let mut lanes_y = f32x4_splat(0.0);
-        let mut slot = self.node_start[index] as usize;
-        let end = self.node_start[index + 1] as usize;
+        let mut slot = record.node_start[local] as usize;
+        let end = record.node_start[local + 1] as usize;
 
         while slot < end {
             let (offset_x, offset_y, scale) = unsafe {
-                let source_x = v128_load(self.node_source_x.as_ptr().add(slot) as *const v128);
-                let source_y = v128_load(self.node_source_y.as_ptr().add(slot) as *const v128);
-                let mass = v128_load(self.node_source_mass.as_ptr().add(slot) as *const v128);
+                let source_x = v128_load(record.node_source_x.as_ptr().add(slot) as *const v128);
+                let source_y = v128_load(record.node_source_y.as_ptr().add(slot) as *const v128);
+                let mass = v128_load(record.node_source_mass.as_ptr().add(slot) as *const v128);
                 let offset_x = f32x4_sub(source_x, splat_x);
                 let offset_y = f32x4_sub(source_y, splat_y);
                 let softened = f32x4_add(
@@ -795,8 +818,8 @@ impl World {
 
         // Bodies stay scalar: there are only a handful and their positions are
         // read live so near-field forces do not go stale.
-        for slot in self.body_start[index] as usize..self.body_start[index + 1] as usize {
-            let other = self.body_items[slot] as usize;
+        for slot in record.body_start[local] as usize..record.body_start[local + 1] as usize {
+            let other = record.body_items[slot] as usize;
             let offset_x = self.x[other] - particle_x;
             let offset_y = self.y[other] - particle_y;
             let softened = offset_x * offset_x + offset_y * offset_y + softening;
@@ -829,56 +852,19 @@ impl World {
     }
 
     fn accumulate_field(&mut self) {
-        let has_hole = self.hole_polarity != 0.0 && self.has_pointer;
-        let has_gravity = self.count > 1;
-        let world_gravity = MAX_WORLD_GRAVITY
-            * (self.gravity_percent / MAX_CONTROL_PERCENT)
-            * GRAVITY_SCALE
-            * ACCELERATION_TO_FRAMES;
-        let recording = has_gravity && !self.has_interactions;
+        let recording = self.count > 1 && !self.has_interactions;
+
+        dispatch_field(self, recording);
 
         if recording {
-            self.node_source_x.clear();
-            self.node_source_y.clear();
-            self.node_source_mass.clear();
-            self.node_start.clear();
-            self.body_items.clear();
-            self.body_start.clear();
-        }
-
-        for index in 0..self.count {
-            let mut acceleration_x = 0.0;
-            let mut acceleration_y = world_gravity;
-
-            if has_gravity {
-                let (gravity_x, gravity_y) = if recording {
-                    self.accumulate_tree_gravity(index)
-                } else {
-                    self.replay_tree_gravity(index)
-                };
-
-                acceleration_x += gravity_x * ACCELERATION_TO_FRAMES;
-                acceleration_y += gravity_y * ACCELERATION_TO_FRAMES;
-            }
-
-            if has_hole {
-                let delta_x = self.pointer_x - self.x[index];
-                let delta_y = self.pointer_y - self.y[index];
-                let scale = self.pointer_hole_scale(delta_x, delta_y) * ACCELERATION_TO_FRAMES;
-
-                acceleration_x += delta_x * scale;
-                acceleration_y += delta_y * scale;
-            }
-
-            self.acceleration_x[index] = acceleration_x;
-            self.acceleration_y[index] = acceleration_y;
-        }
-
-        if recording {
-            // One extra entry so every particle has a closing range bound.
-            self.node_start.push(self.node_source_x.len() as u32);
-            self.body_start.push(self.body_items.len() as u32);
             self.has_interactions = true;
+        }
+    }
+
+    #[cfg(target_feature = "atomics")]
+    fn ensure_records(&mut self, needed: usize) {
+        while self.records.len() < needed {
+            self.records.push(Record::default());
         }
     }
 
@@ -1259,11 +1245,237 @@ impl World {
     }
 }
 
-/// wasm32-unknown-unknown has no threads, so a plain cell is sound here and
-/// avoids the sharp edges of a `static mut`.
+// ---- worker pool -----------------------------------------------------------
+
+/// Below this the barrier costs more than the work it hands out.
+#[cfg(target_feature = "atomics")]
+const MIN_PARALLEL_PARTICLES: usize = 256;
+
+/// Recording walks the tree and is the single most expensive phase; replay just
+/// re-evaluates the list it left behind. Both are indexed by particle and write
+/// only their own slice, so splitting either one stays bit-identical.
+fn field_slice(world: &World, slot: usize, start: usize, end: usize, recording: bool) {
+    let has_hole = world.hole_polarity != 0.0 && world.has_pointer;
+    let has_gravity = world.count > 1;
+    let world_gravity = MAX_WORLD_GRAVITY
+        * (world.gravity_percent / MAX_CONTROL_PERCENT)
+        * GRAVITY_SCALE
+        * ACCELERATION_TO_FRAMES;
+    let out_x = world.acceleration_x.as_ptr().cast_mut();
+    let out_y = world.acceleration_y.as_ptr().cast_mut();
+    // Slots are disjoint, so no two threads ever touch the same record.
+    let record = unsafe { &mut *world.records.as_ptr().cast_mut().add(slot) };
+
+    if recording {
+        record.node_source_x.clear();
+        record.node_source_y.clear();
+        record.node_source_mass.clear();
+        record.node_start.clear();
+        record.body_items.clear();
+        record.body_start.clear();
+    }
+
+    for index in start..end {
+        let mut acceleration_x = 0.0;
+        let mut acceleration_y = world_gravity;
+
+        if has_gravity {
+            let (gravity_x, gravity_y) = if recording {
+                world.record_tree_gravity(record, index)
+            } else {
+                world.replay_tree_gravity(record, index - start, index)
+            };
+
+            acceleration_x += gravity_x * ACCELERATION_TO_FRAMES;
+            acceleration_y += gravity_y * ACCELERATION_TO_FRAMES;
+        }
+
+        if has_hole {
+            let delta_x = world.pointer_x - world.x[index];
+            let delta_y = world.pointer_y - world.y[index];
+            let scale = world.pointer_hole_scale(delta_x, delta_y) * ACCELERATION_TO_FRAMES;
+
+            acceleration_x += delta_x * scale;
+            acceleration_y += delta_y * scale;
+        }
+
+        unsafe {
+            *out_x.add(index) = acceleration_x;
+            *out_y.add(index) = acceleration_y;
+        }
+    }
+
+    if recording {
+        // One extra entry so every particle has a closing range bound.
+        record.node_start.push(record.node_source_x.len() as u32);
+        record.body_start.push(record.body_items.len() as u32);
+    }
+}
+
+#[cfg(not(target_feature = "atomics"))]
+fn dispatch_field(world: &mut World, recording: bool) {
+    field_slice(world, 0, 0, world.count, recording);
+}
+
+#[cfg(target_feature = "atomics")]
+pub use pool::*;
+
+#[cfg(target_feature = "atomics")]
+mod pool {
+    use super::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const MAX_WORKERS: usize = 16;
+    /// Spread across the pool, so adding helpers does not multiply the CPU burnt
+    /// waiting. A dispatch lands roughly every millisecond, which is close
+    /// enough to a futex wake that spinning is only worth a little.
+    const SPIN_BUDGET: u32 = 80_000;
+    const WORKER_TLS_BYTES: usize = 4 * 1024;
+    const WORKER_STACK_BYTES: usize = 60 * 1024;
+    const WORKER_BLOCK_BYTES: usize = WORKER_TLS_BYTES + WORKER_STACK_BYTES;
+
+    /// Thread stacks come from a static block so no thread has to allocate,
+    /// which would race the host instance's allocator.
+    #[repr(align(16))]
+    struct WorkerArena(#[allow(dead_code)] [u8; MAX_WORKERS * WORKER_BLOCK_BYTES]);
+
+    static mut WORKER_ARENA: WorkerArena = WorkerArena([0; MAX_WORKERS * WORKER_BLOCK_BYTES]);
+    static FIELD_EPOCH: AtomicU32 = AtomicU32::new(0);
+    static FIELD_DONE: AtomicU32 = AtomicU32::new(0);
+    static FIELD_RECORDING: AtomicU32 = AtomicU32::new(0);
+    static WORKER_READY: AtomicU32 = AtomicU32::new(0);
+    static WORKER_TOTAL: AtomicU32 = AtomicU32::new(1);
+    /// Waking nobody still costs a call, and the other side is usually still
+    /// spinning, so both sides publish whether they are actually parked.
+    static HELPERS_PARKED: AtomicU32 = AtomicU32::new(0);
+    static HOST_PARKED: AtomicU32 = AtomicU32::new(0);
+
+    fn spin_budget() -> u32 {
+        SPIN_BUDGET / WORKER_TOTAL.load(Ordering::Relaxed).max(1)
+    }
+
+    fn slice_bounds(index: usize, workers: usize, count: usize) -> (usize, usize) {
+        let share = count.div_ceil(workers);
+        let start = (index * share).min(count);
+
+        (start, (start + share).min(count))
+    }
+
+    /// Publishes a job to the pool, takes the first slice, then waits.
+    pub(super) fn dispatch_field(world: &mut World, recording: bool) {
+        let workers = WORKER_TOTAL.load(Ordering::Relaxed).max(1);
+
+        if workers == 1 || world.count < MIN_PARALLEL_PARTICLES {
+            field_slice(world, 0, 0, world.count, recording);
+            return;
+        }
+
+        // Helpers are parked here, so growing the record list cannot pull the
+        // backing store out from under them.
+        world.ensure_records(workers as usize);
+
+        FIELD_RECORDING.store(u32::from(recording), Ordering::Release);
+        FIELD_DONE.store(0, Ordering::Release);
+        FIELD_EPOCH.fetch_add(1, Ordering::AcqRel);
+
+        if HELPERS_PARKED.load(Ordering::Acquire) > 0 {
+            unsafe { memory_atomic_notify(FIELD_EPOCH.as_ptr().cast(), u32::MAX) };
+        }
+
+        let (start, end) = slice_bounds(0, workers as usize, world.count);
+
+        field_slice(world, 0, start, end, recording);
+
+        let budget = spin_budget();
+        let mut spins = 0;
+
+        loop {
+            let done = FIELD_DONE.load(Ordering::Acquire);
+
+            if done >= workers - 1 {
+                break;
+            }
+
+            spins += 1;
+
+            if spins > budget {
+                // wait32 rechecks the value, so a notify missed between the
+                // load above and parking here cannot strand the host.
+                HOST_PARKED.store(1, Ordering::Release);
+                unsafe { memory_atomic_wait32(FIELD_DONE.as_ptr().cast(), done as i32, -1) };
+                HOST_PARKED.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn worker_tls_base(index: u32) -> u32 {
+        (&raw const WORKER_ARENA) as usize as u32 + index * WORKER_BLOCK_BYTES as u32
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn worker_stack_top(index: u32) -> u32 {
+        worker_tls_base(index) + WORKER_BLOCK_BYTES as u32
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn set_worker_count(count: u32) {
+        WORKER_TOTAL.store(count.clamp(1, MAX_WORKERS as u32), Ordering::Release);
+    }
+
+    /// Counts helpers that have latched the epoch and are about to park. The
+    /// host waits for this before enabling the pool, because a helper that
+    /// latched a later epoch would never answer the job already in flight.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn worker_ready_count() -> u32 {
+        WORKER_READY.load(Ordering::Acquire)
+    }
+
+    /// Never returns. Helpers park here until the field phase wakes them.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn worker_run(index: u32) {
+        let mut seen = FIELD_EPOCH.load(Ordering::Acquire);
+
+        WORKER_READY.fetch_add(1, Ordering::AcqRel);
+
+        loop {
+            let budget = spin_budget();
+            let mut spins = 0;
+
+            while FIELD_EPOCH.load(Ordering::Acquire) == seen {
+                spins += 1;
+
+                if spins > budget {
+                    HELPERS_PARKED.fetch_add(1, Ordering::AcqRel);
+                    unsafe { memory_atomic_wait32(FIELD_EPOCH.as_ptr().cast(), seen as i32, -1) };
+                    HELPERS_PARKED.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+
+            seen = FIELD_EPOCH.load(Ordering::Acquire);
+
+            let world: &World = world();
+            let workers = WORKER_TOTAL.load(Ordering::Relaxed).max(1) as usize;
+            let recording = FIELD_RECORDING.load(Ordering::Acquire) != 0;
+            let (start, end) = slice_bounds(index as usize, workers, world.count);
+
+            field_slice(world, index as usize, start, end, recording);
+            FIELD_DONE.fetch_add(1, Ordering::AcqRel);
+
+            if HOST_PARKED.load(Ordering::Acquire) != 0 {
+                unsafe { memory_atomic_notify(FIELD_DONE.as_ptr().cast(), u32::MAX) };
+            }
+        }
+    }
+}
+
+/// Helper threads only ever take disjoint particle slices, so a plain cell is
+/// sound here and avoids the sharp edges of a `static mut`.
 struct GlobalWorld(UnsafeCell<Option<World>>);
 
-// SAFETY: the host is single threaded, so no other thread can observe this.
+// SAFETY: only the host thread mutates the world. Helpers run solely inside a
+// field dispatch, where they read shared state and write accelerations and the
+// record for their own slot, and the barrier orders that against the host.
 unsafe impl Sync for GlobalWorld {}
 
 static WORLD: GlobalWorld = GlobalWorld(UnsafeCell::new(None));

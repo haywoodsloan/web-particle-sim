@@ -1,3 +1,6 @@
+# Pins the toolchain for the shipped single threaded module and for lint. The
+# threaded module additionally needs nightly, because rebuilding std with
+# atomics goes through -Z build-std; scripts/build-wasm.mjs installs that.
 [toolchain]
 channel = "stable"
 targets = ["wasm32-unknown-unknown"]

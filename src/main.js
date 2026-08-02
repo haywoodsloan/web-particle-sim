@@ -62,7 +62,10 @@ document.querySelector('#app').innerHTML = `
     Move your pointer across the screen to spray rainbow particles.
   </canvas>
   <div id="pointer-hole" aria-hidden="true"></div>
-  <div id="particle-count" aria-hidden="true"></div>
+  <div id="particle-count" aria-hidden="true">
+    <span id="thread-mode"></span>
+    <span id="particle-total"></span>
+  </div>
   <div id="rate-stats" aria-hidden="true">
     <span id="frame-rate"></span>
     <span id="tick-rate"></span>
@@ -91,6 +94,8 @@ document.querySelector('#app').innerHTML = `
 const canvas = document.querySelector('#particle-canvas')
 const pointerHole = document.querySelector('#pointer-hole')
 const particleCount = document.querySelector('#particle-count')
+const particleTotal = document.querySelector('#particle-total')
+const threadMode = document.querySelector('#thread-mode')
 const rateStats = document.querySelector('#rate-stats')
 const frameRate = document.querySelector('#frame-rate')
 const tickRate = document.querySelector('#tick-rate')
@@ -473,7 +478,7 @@ function drawFrame(time) {
       const steps = latestSnapshot?.views.header[2] ?? 0
       const ticks = (steps - statsSteps) >>> 0
 
-      particleCount.textContent = `${latestSnapshot?.count ?? 0}`
+      particleTotal.textContent = `${latestSnapshot?.count ?? 0}`
       frameRate.textContent = `${Math.round((statsFrames * 1000) / elapsed)} fps`
       tickRate.textContent = `${Math.round((ticks * 1000) / elapsed)} tps`
       statsFrames = 0
@@ -524,6 +529,8 @@ physicsWorker.onerror = (event) => {
 physicsWorker.onmessage = ({ data }) => {
   if (data.type === MESSAGE_READY) {
     isWorkerReady = true
+    threadMode.textContent =
+      data.threads === 1 ? '1 thread' : `${data.threads} threads`
 
     for (const { message, transfer } of queuedWorkerMessages) {
       physicsWorker.postMessage(message, transfer)

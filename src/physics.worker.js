@@ -14,12 +14,104 @@ import {
   MESSAGE_VISIBILITY,
 } from './simulation-shared.js'
 import initialisePhysics from './physics.wasm?init'
+import threadedWasmUrl from './physics-threads.wasm?url'
 
 const SNAPSHOT_POOL_SIZE = 4
+// Matches MAX_WORKERS in the engine, counting the worker itself. Gains measured
+// monotonic out to here; smaller machines are capped by hardwareConcurrency.
+const MAX_HELPERS = 15
+const HELPER_START_TIMEOUT = 3000
+const SHARED_MEMORY_PAGES = 256
+const SHARED_MEMORY_MAX_PAGES = 16384
+
+async function startThreaded() {
+  const memory = new WebAssembly.Memory({
+    initial: SHARED_MEMORY_PAGES,
+    maximum: SHARED_MEMORY_MAX_PAGES,
+    shared: true,
+  })
+  // Compiled by hand rather than through ?init so the module can be handed to
+  // the helpers; a WebAssembly.Module is structured cloneable.
+  const module = await WebAssembly.compileStreaming(fetch(threadedWasmUrl))
+  const { exports } = await WebAssembly.instantiate(module, { env: { memory } })
+  // One core short of the machine, so this worker plus its helpers leave the
+  // renderer somewhere to run. Measured worth ~3% on an eight core machine.
+  const wanted = Math.max(
+    0,
+    Math.min(MAX_HELPERS, (navigator.hardwareConcurrency ?? 2) - 2),
+  )
+
+  if (wanted === 0) {
+    return { exports, memory, threads: 1 }
+  }
+
+  const helpers = []
+  let helperFailed = false
+
+  for (let index = 1; index <= wanted; index += 1) {
+    const helper = new Worker(new URL('./physics.thread.js', import.meta.url), {
+      type: 'module',
+    })
+
+    helper.addEventListener('error', () => {
+      helperFailed = true
+    })
+    helper.postMessage({ module, memory, index })
+    helpers.push(helper)
+  }
+
+  // A helper parks inside wasm and never returns, so the only way to retract
+  // one is to terminate it. Leaving strays behind would burn a core spinning.
+  const abandon = () => {
+    for (const helper of helpers) {
+      helper.terminate()
+    }
+
+    exports.set_worker_count(1)
+
+    return { exports, memory, threads: 1 }
+  }
+
+  // Enabling the pool before every helper is parked would strand the first job.
+  const deadline = Date.now() + HELPER_START_TIMEOUT
+
+  while (exports.worker_ready_count() < wanted) {
+    if (helperFailed || Date.now() > deadline) {
+      return abandon()
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  exports.set_worker_count(wanted + 1)
+
+  return { exports, memory, threads: wanted + 1 }
+}
+
+async function startPhysics() {
+  if (self.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') {
+    try {
+      return await startThreaded()
+    } catch {
+      // Fall through to the single threaded module.
+    }
+  }
+
+  const instance = await initialisePhysics()
+
+  return {
+    exports: instance.exports,
+    memory: instance.exports.memory,
+    threads: 1,
+  }
+}
 
 const snapshotBufferPool = []
-const instance = await initialisePhysics()
-const physics = instance.exports
+const {
+  exports: physics,
+  memory: wasmMemory,
+  threads: physicsThreads,
+} = await startPhysics()
 
 /** Views detach whenever the module grows its memory, so they are revalidated. */
 let memoryBuffer = null
@@ -31,8 +123,8 @@ let stepTimerId = null
 let nextStepTime = 0
 
 function getMemoryBytes() {
-  if (memoryBuffer !== physics.memory.buffer) {
-    memoryBuffer = physics.memory.buffer
+  if (memoryBuffer !== wasmMemory.buffer) {
+    memoryBuffer = wasmMemory.buffer
     memoryBytes = new Uint8Array(memoryBuffer)
   }
 
@@ -199,4 +291,4 @@ self.onmessage = ({ data }) => {
 
 // Instantiating the module makes this a top-level-await module, so the port is
 // already live before `onmessage` exists. Anything sent earlier would be lost.
-self.postMessage({ type: MESSAGE_READY })
+self.postMessage({ type: MESSAGE_READY, threads: physicsThreads })

@@ -14,7 +14,9 @@ dist-ssr
 
 # Rust physics engine build output
 physics/target
+physics/target-threads
 src/physics.wasm
+src/physics-threads.wasm
 
 # Editor directories and files
 .vscode/*

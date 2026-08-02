@@ -39,6 +39,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             physics/target
+            physics/target-threads
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', 'physics/Cargo.toml', 'physics/src/**') }}
           restore-keys: ${{ runner.os }}-cargo-
 
@@ -52,6 +53,7 @@ jobs:
         run: npm run lint
 
       - name: Build site
+        # Installs the nightly toolchain the threaded module needs, if missing.
         run: npm run build
 
       - name: Upload Pages artifact
