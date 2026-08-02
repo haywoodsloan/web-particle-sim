@@ -56,8 +56,7 @@ const PARTICLE_DENSITY: f32 = 9.8e-5;
 /// Stokes drag on a disc decelerates it by radius / mass, so a small light
 /// particle brakes far harder than a big dense one. Normalised against a mid
 /// sized particle so the air control keeps the range it always had.
-const DRAG_REFERENCE: f32 =
-    1.0 / (PARTICLE_DENSITY * core::f32::consts::PI * MEAN_PARTICLE_RADIUS);
+const DRAG_REFERENCE: f32 = 1.0 / (PARTICLE_DENSITY * core::f32::consts::PI * MEAN_PARTICLE_RADIUS);
 /// Same size need not mean same mass, so density varies too. It costs nothing
 /// in the broad phase, but a wider mass spread still flings light particles
 /// faster, which drives the substep rate.
@@ -224,7 +223,8 @@ impl World {
         self.acceleration_x.resize(required, 0.0);
         self.acceleration_y.resize(required, 0.0);
         self.radius.resize(required, MIN_PARTICLE_RADIUS);
-        self.mass.resize(required, mass_for(MIN_PARTICLE_RADIUS, 1.0));
+        self.mass
+            .resize(required, mass_for(MIN_PARTICLE_RADIUS, 1.0));
         self.drag_scale.resize(required, 1.0);
         self.retained.resize(required, 1.0);
         self.color.resize(required, 0);
