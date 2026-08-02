@@ -557,7 +557,16 @@ configureCanvas()
 document
   .querySelector('#controls-dismiss')
   .addEventListener('click', () => controlsDialog.close())
-controlsDialog.showModal()
+
+// The isolation shim reloads the page on a first visit, so hold the intro back
+// rather than show it, lose it to the reload, and show it again.
+if (window.coiReloadPending) {
+  window.addEventListener('coi-settled', () => controlsDialog.showModal(), {
+    once: true,
+  })
+} else {
+  controlsDialog.showModal()
+}
 sendToWorker(
   {
     type: MESSAGE_INIT,

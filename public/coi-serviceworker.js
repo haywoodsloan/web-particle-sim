@@ -44,13 +44,28 @@ if (typeof window === 'undefined') {
 } else {
   const scriptUrl = document.currentScript.src
   const RELOAD_FLAG = 'coi-reloaded'
+  const alreadyTried = sessionStorage.getItem(RELOAD_FLAG)
+  // Decided synchronously, before the app's module runs, so it can hold back
+  // its intro rather than flash it once here and again after the reload.
+  const willReload =
+    !window.crossOriginIsolated &&
+    window.isSecureContext &&
+    Boolean(navigator.serviceWorker) &&
+    !alreadyTried
+
+  window.coiReloadPending = willReload
+
+  const settle = () => {
+    window.coiReloadPending = false
+    window.dispatchEvent(new Event('coi-settled'))
+  }
 
   ;(async () => {
-    if (window.crossOriginIsolated || !window.isSecureContext) {
-      return
-    }
+    if (!willReload) {
+      if (window.crossOriginIsolated) {
+        sessionStorage.removeItem(RELOAD_FLAG)
+      }
 
-    if (!navigator.serviceWorker) {
       return
     }
 
@@ -61,18 +76,16 @@ if (typeof window === 'undefined') {
       // boot loop if isolation still fails for some other reason.
       if (!navigator.serviceWorker.controller) {
         await registration.update()
-
-        if (!sessionStorage.getItem(RELOAD_FLAG)) {
-          sessionStorage.setItem(RELOAD_FLAG, '1')
-          window.location.reload()
-        }
+        sessionStorage.setItem(RELOAD_FLAG, '1')
+        window.location.reload()
 
         return
       }
 
-      sessionStorage.removeItem(RELOAD_FLAG)
+      settle()
     } catch {
       // Isolation is an optimisation; the simulation falls back to one thread.
+      settle()
     }
   })()
 }
