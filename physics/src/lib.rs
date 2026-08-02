@@ -21,9 +21,13 @@ const PARTICLE_GRAVITY_SOFTENING: f32 = 4.0;
 const POINTER_HOLE_RADIUS: f32 = 375.0;
 const POINTER_HOLE_MASS: f32 = 288.0;
 const POINTER_HOLE_SOFTENING: f32 = 90.0;
-const PARTICLE_RADIUS: f32 = 1.8;
+/// Broad phase cells are sized to the widest contact, so the spread is kept
+/// modest: widening it makes every dense-cluster cell hold more candidates.
+const MIN_PARTICLE_RADIUS: f32 = 1.5;
+const MAX_PARTICLE_RADIUS: f32 = 2.0;
+const MEAN_PARTICLE_RADIUS: f32 = (MIN_PARTICLE_RADIUS + MAX_PARTICLE_RADIUS) * 0.5;
 const SNAPSHOT_HEADER_BYTES: usize = 16;
-const SNAPSHOT_BYTES_PER_PARTICLE: usize = 14;
+const SNAPSHOT_BYTES_PER_PARTICLE: usize = 18;
 const SNAPSHOT_FLAG_DISCONTINUOUS: u32 = 1;
 const PARTICLE_FLAG_RESPAWNED: u8 = 1;
 /// Fade level occupies the bits above the respawn flag.
@@ -38,14 +42,22 @@ const SUBSTEP_SPEED_MARGIN: f32 = 1.25;
 /// Passes over the contact set per substep. Beyond the first the velocity swap
 /// has already separated every pair, so the rest only relax residual overlap.
 const CONTACT_ITERATIONS: usize = 2;
-const CONTACT_DIAMETER: f32 = PARTICLE_RADIUS * 2.0;
-const CONTACT_DIAMETER_SQUARED: f32 = CONTACT_DIAMETER * CONTACT_DIAMETER;
-const INVERSE_CELL_SIZE: f32 = 1.0 / CONTACT_DIAMETER;
+/// Gravity is ~60% of a step and moves slowly next to contacts, so it is
+/// refreshed on a fraction of the substeps. Holding it longer costs energy
+/// drift, which is why this is small rather than the whole step.
+const SUBSTEPS_PER_FIELD_UPDATE: usize = 2;
+/// No pair can touch beyond the widest contact, so cells are sized to that and
+/// the 3x3 neighbourhood still catches every candidate.
+const MAX_CONTACT_DIAMETER: f32 = MAX_PARTICLE_RADIUS * 2.0;
+const INVERSE_CELL_SIZE: f32 = 1.0 / MAX_CONTACT_DIAMETER;
 /// Overlap is removed positionally so that separating never adds energy.
 const POSITION_CORRECTION: f32 = 0.8;
 const PARTICLE_DENSITY: f32 = 9.8e-5;
-const PARTICLE_MASS: f32 =
-    PARTICLE_DENSITY * core::f32::consts::PI * PARTICLE_RADIUS * PARTICLE_RADIUS;
+/// Same size need not mean same mass, so density varies too. It costs nothing
+/// in the broad phase, but a wider mass spread still flings light particles
+/// faster, which drives the substep rate.
+const MIN_DENSITY_SCALE: f32 = 0.7;
+const MAX_DENSITY_SCALE: f32 = 1.4;
 const BARNES_HUT_THETA_SQUARED: f32 = 0.5 * 0.5;
 const MAX_TREE_DEPTH: u32 = 20;
 const SPAWN_JITTER: f32 = 2.5;
@@ -77,6 +89,12 @@ fn clamp(value: f32, minimum: f32, maximum: f32) -> f32 {
     }
 }
 
+/// Uniform density, so a wider particle is heavier by the square of its radius.
+#[inline]
+fn mass_for(radius: f32, density_scale: f32) -> f32 {
+    PARTICLE_DENSITY * density_scale * core::f32::consts::PI * radius * radius
+}
+
 #[inline]
 fn hash_cell(cell_x: i32, cell_y: i32) -> usize {
     let x = (cell_x as u32).wrapping_mul(0x9E37_79B1);
@@ -92,6 +110,8 @@ struct World {
     velocity_y: Vec<f32>,
     acceleration_x: Vec<f32>,
     acceleration_y: Vec<f32>,
+    radius: Vec<f32>,
+    mass: Vec<f32>,
     color: Vec<u8>,
     respawned: Vec<u8>,
     /// Frames of fade left. Infinite for a particle that is still alive.
@@ -154,6 +174,7 @@ struct World {
 
     batch_x: Vec<f32>,
     batch_y: Vec<f32>,
+    batch_radius: Vec<f32>,
     snapshot: Vec<u8>,
 }
 
@@ -193,6 +214,8 @@ impl World {
         self.velocity_y.resize(required, 0.0);
         self.acceleration_x.resize(required, 0.0);
         self.acceleration_y.resize(required, 0.0);
+        self.radius.resize(required, MIN_PARTICLE_RADIUS);
+        self.mass.resize(required, mass_for(MIN_PARTICLE_RADIUS, 1.0));
         self.color.resize(required, 0);
         self.respawned.resize(required, 0);
         self.fade.resize(required, f32::INFINITY);
@@ -236,6 +259,8 @@ impl World {
         self.velocity_y[index] = self.velocity_y[last];
         self.acceleration_x[index] = self.acceleration_x[last];
         self.acceleration_y[index] = self.acceleration_y[last];
+        self.radius[index] = self.radius[last];
+        self.mass[index] = self.mass[last];
         self.color[index] = self.color[last];
         self.fade[index] = self.fade[last];
         self.birth[index] = self.birth[last];
@@ -335,8 +360,9 @@ impl World {
         let offset_x = self.x[second] - self.x[first];
         let offset_y = self.y[second] - self.y[first];
         let distance_squared = offset_x * offset_x + offset_y * offset_y;
+        let contact = self.radius[first] + self.radius[second];
 
-        if distance_squared >= CONTACT_DIAMETER_SQUARED || distance_squared <= 1e-12 {
+        if distance_squared >= contact * contact || distance_squared <= 1e-12 {
             return;
         }
 
@@ -345,21 +371,28 @@ impl World {
         let normal_y = offset_y / distance;
         let approach = (self.velocity_x[second] - self.velocity_x[first]) * normal_x
             + (self.velocity_y[second] - self.velocity_y[first]) * normal_y;
+        let inverse_first = 1.0 / self.mass[first];
+        let inverse_second = 1.0 / self.mass[second];
+        let inverse_total = inverse_first + inverse_second;
 
-        // Equal masses trade their normal components, which is exactly elastic.
+        // Fully elastic impulse. With equal masses it reduces to trading the
+        // normal components; unequal ones recoil in proportion to their mass.
         if approach < 0.0 {
-            self.velocity_x[first] += approach * normal_x;
-            self.velocity_y[first] += approach * normal_y;
-            self.velocity_x[second] -= approach * normal_x;
-            self.velocity_y[second] -= approach * normal_y;
+            let impulse = -2.0 * approach / inverse_total;
+
+            self.velocity_x[first] -= impulse * inverse_first * normal_x;
+            self.velocity_y[first] -= impulse * inverse_first * normal_y;
+            self.velocity_x[second] += impulse * inverse_second * normal_x;
+            self.velocity_y[second] += impulse * inverse_second * normal_y;
         }
 
-        let push = (CONTACT_DIAMETER - distance) * 0.5 * POSITION_CORRECTION;
+        // Split the same way, so a heavy particle barely yields to a light one.
+        let push = (contact - distance) * POSITION_CORRECTION / inverse_total;
 
-        self.x[first] -= normal_x * push;
-        self.y[first] -= normal_y * push;
-        self.x[second] += normal_x * push;
-        self.y[second] += normal_y * push;
+        self.x[first] -= normal_x * push * inverse_first;
+        self.y[first] -= normal_y * push * inverse_first;
+        self.x[second] += normal_x * push * inverse_second;
+        self.y[second] += normal_y * push * inverse_second;
     }
 
     fn solve_contacts(&mut self) {
@@ -441,9 +474,11 @@ impl World {
 
     #[inline]
     fn add_body_to_node(&mut self, node: usize, index: usize) {
-        self.tree_mass[node] += PARTICLE_MASS as f64;
-        self.tree_weighted_x[node] += self.x[index] as f64 * PARTICLE_MASS as f64;
-        self.tree_weighted_y[node] += self.y[index] as f64 * PARTICLE_MASS as f64;
+        let mass = self.mass[index] as f64;
+
+        self.tree_mass[node] += mass;
+        self.tree_weighted_x[node] += self.x[index] as f64 * mass;
+        self.tree_weighted_y[node] += self.y[index] as f64 * mass;
     }
 
     #[inline]
@@ -620,7 +655,8 @@ impl World {
                         let softened = offset_x * offset_x
                             + offset_y * offset_y
                             + PARTICLE_GRAVITY_SOFTENING * PARTICLE_GRAVITY_SOFTENING;
-                        let scale = PARTICLE_GRAVITY * PARTICLE_MASS / (softened * softened.sqrt());
+                        let scale =
+                            PARTICLE_GRAVITY * self.mass[slot] / (softened * softened.sqrt());
 
                         acceleration_x += offset_x * scale;
                         acceleration_y += offset_y * scale;
@@ -728,7 +764,7 @@ impl World {
             let offset_x = self.x[other] - particle_x;
             let offset_y = self.y[other] - particle_y;
             let softened = offset_x * offset_x + offset_y * offset_y + softening;
-            let scale = PARTICLE_GRAVITY * PARTICLE_MASS / (softened * softened.sqrt());
+            let scale = PARTICLE_GRAVITY * self.mass[other] / (softened * softened.sqrt());
 
             acceleration_x += offset_x * scale;
             acceleration_y += offset_y * scale;
@@ -812,12 +848,13 @@ impl World {
 
     // ---- emission ----------------------------------------------------------
 
-    fn is_spawn_position_free(&self, x: f32, y: f32) -> bool {
+    fn is_spawn_position_free(&self, x: f32, y: f32, radius: f32) -> bool {
         for slot in 0..self.batch_x.len() {
             let offset_x = self.batch_x[slot] - x;
             let offset_y = self.batch_y[slot] - y;
+            let contact = radius + self.batch_radius[slot];
 
-            if offset_x * offset_x + offset_y * offset_y < CONTACT_DIAMETER_SQUARED {
+            if offset_x * offset_x + offset_y * offset_y < contact * contact {
                 return false;
             }
         }
@@ -840,8 +877,9 @@ impl World {
 
                     let delta_x = self.x[other] - x;
                     let delta_y = self.y[other] - y;
+                    let contact = radius + self.radius[other];
 
-                    if delta_x * delta_x + delta_y * delta_y < CONTACT_DIAMETER_SQUARED {
+                    if delta_x * delta_x + delta_y * delta_y < contact * contact {
                         return false;
                     }
                 }
@@ -856,27 +894,20 @@ impl World {
             return;
         }
 
-        let max_x = (self.width - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
-        let max_y = (self.height - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
+        let radius = self.random_between(MIN_PARTICLE_RADIUS, MAX_PARTICLE_RADIUS);
+        let max_x = (self.width - radius).max(radius);
+        let max_y = (self.height - radius).max(radius);
         let mut position_x = 0.0;
         let mut position_y = 0.0;
         let mut has_placement = false;
 
         for attempt in 0..SPAWN_PLACEMENT_ATTEMPTS {
-            let jitter = SPAWN_JITTER + attempt as f32 * PARTICLE_RADIUS;
+            let jitter = SPAWN_JITTER + attempt as f32 * radius;
 
-            position_x = clamp(
-                x + self.random_between(-jitter, jitter),
-                PARTICLE_RADIUS,
-                max_x,
-            );
-            position_y = clamp(
-                y + self.random_between(-jitter, jitter),
-                PARTICLE_RADIUS,
-                max_y,
-            );
+            position_x = clamp(x + self.random_between(-jitter, jitter), radius, max_x);
+            position_y = clamp(y + self.random_between(-jitter, jitter), radius, max_y);
 
-            if self.is_spawn_position_free(position_x, position_y) {
+            if self.is_spawn_position_free(position_x, position_y, radius) {
                 has_placement = true;
                 break;
             }
@@ -908,6 +939,11 @@ impl World {
         self.alive_count += 1;
         self.x[index] = position_x;
         self.y[index] = position_y;
+        self.radius[index] = radius;
+        self.mass[index] = mass_for(
+            radius,
+            self.random_between(MIN_DENSITY_SCALE, MAX_DENSITY_SCALE),
+        );
         self.velocity_x[index] = (heading + spread).cos() * speed;
         self.velocity_y[index] = (heading + spread).sin() * speed;
         // Hue spans the whole byte, so the host can shade a continuous wheel.
@@ -918,6 +954,7 @@ impl World {
         self.next_birth = self.next_birth.wrapping_add(1);
         self.batch_x.push(position_x);
         self.batch_y.push(position_y);
+        self.batch_radius.push(radius);
     }
 
     fn emit_from_pointer(&mut self, x: f32, y: f32, time: f64) {
@@ -985,50 +1022,57 @@ impl World {
         }
     }
 
-    /// A pair passes straight through each other when either crosses a contact
-    /// diameter inside one substep, so the fastest particle sets the count.
+    /// A pair passes straight through each other when either crosses their
+    /// combined radii inside one substep. Sizing that against a typical partner
+    /// rather than the smallest keeps the rate down; the residual overlap it
+    /// leaves is measured rather than assumed.
     fn choose_substeps(&self) -> usize {
-        let mut fastest_squared = 0.0f32;
+        let mut needed = 0.0f32;
 
         for index in 0..self.count {
             let speed_squared = self.velocity_x[index] * self.velocity_x[index]
                 + self.velocity_y[index] * self.velocity_y[index];
+            let reach = self.radius[index] + MEAN_PARTICLE_RADIUS;
+            let rate = speed_squared / (reach * reach);
 
-            if speed_squared > fastest_squared {
-                fastest_squared = speed_squared;
+            if rate > needed {
+                needed = rate;
             }
         }
 
-        let needed = (fastest_squared.sqrt() * SUBSTEP_SPEED_MARGIN / CONTACT_DIAMETER).ceil();
+        let needed = (needed.sqrt() * SUBSTEP_SPEED_MARGIN).ceil();
 
         // Saturating cast, so an infinite speed lands on the ceiling.
         (needed as usize).clamp(MIN_PHYSICS_SUBSTEPS, MAX_PHYSICS_SUBSTEPS)
     }
 
     fn solve_walls(&mut self) {
-        let max_x = (self.width - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
-        let max_y = (self.height - PARTICLE_RADIUS).max(PARTICLE_RADIUS);
-
         for index in 0..self.count {
-            if self.x[index] < PARTICLE_RADIUS {
-                self.x[index] = PARTICLE_RADIUS;
+            let radius = self.radius[index];
+            let max_x = (self.width - radius).max(radius);
+            let max_y = (self.height - radius).max(radius);
+
+            // Mirroring the overshoot rather than dropping it keeps the bounce
+            // where it belongs; clamped in case a resize left it far outside.
+            if self.x[index] < radius {
+                self.x[index] = (2.0 * radius - self.x[index]).min(max_x);
                 if self.velocity_x[index] < 0.0 {
                     self.velocity_x[index] = -self.velocity_x[index];
                 }
             } else if self.x[index] > max_x {
-                self.x[index] = max_x;
+                self.x[index] = (2.0 * max_x - self.x[index]).max(radius);
                 if self.velocity_x[index] > 0.0 {
                     self.velocity_x[index] = -self.velocity_x[index];
                 }
             }
 
-            if self.y[index] < PARTICLE_RADIUS {
-                self.y[index] = PARTICLE_RADIUS;
+            if self.y[index] < radius {
+                self.y[index] = (2.0 * radius - self.y[index]).min(max_y);
                 if self.velocity_y[index] < 0.0 {
                     self.velocity_y[index] = -self.velocity_y[index];
                 }
             } else if self.y[index] > max_y {
-                self.y[index] = max_y;
+                self.y[index] = (2.0 * max_y - self.y[index]).max(radius);
                 if self.velocity_y[index] > 0.0 {
                     self.velocity_y[index] = -self.velocity_y[index];
                 }
@@ -1053,9 +1097,9 @@ impl World {
                 self.build_gravity_tree();
             }
 
-            // A field held stale across a frame drains energy from particles
-            // orbiting inside a cluster, so it is rebuilt every substep.
-            if self.count > 0 {
+            // A field held stale for a whole frame drains energy from particles
+            // orbiting inside a cluster, so it is only held for a substep or two.
+            if self.count > 0 && substep % SUBSTEPS_PER_FIELD_UPDATE == 0 {
                 self.accumulate_field();
             }
 
@@ -1066,6 +1110,7 @@ impl World {
 
         self.batch_x.clear();
         self.batch_y.clear();
+        self.batch_radius.clear();
         self.step_index = self.step_index.wrapping_add(1);
     }
 
@@ -1105,8 +1150,9 @@ impl World {
         self.snapshot[12..16].copy_from_slice(&0u32.to_le_bytes());
 
         let speeds = SNAPSHOT_HEADER_BYTES + count * 8;
-        let colors = SNAPSHOT_HEADER_BYTES + count * 12;
-        let particle_flags = SNAPSHOT_HEADER_BYTES + count * 13;
+        let radii = SNAPSHOT_HEADER_BYTES + count * 12;
+        let colors = SNAPSHOT_HEADER_BYTES + count * 16;
+        let particle_flags = SNAPSHOT_HEADER_BYTES + count * 17;
 
         for index in 0..count {
             let position = SNAPSHOT_HEADER_BYTES + index * 8;
@@ -1120,6 +1166,8 @@ impl World {
 
             self.snapshot[speeds + index * 4..speeds + index * 4 + 4]
                 .copy_from_slice(&speed.to_le_bytes());
+            self.snapshot[radii + index * 4..radii + index * 4 + 4]
+                .copy_from_slice(&self.radius[index].to_le_bytes());
             self.snapshot[colors + index] = self.color[index];
 
             let fade = self.fade[index];

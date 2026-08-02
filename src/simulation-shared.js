@@ -1,7 +1,6 @@
 // Values the renderer shares with the engine. Their counterparts live in
 // physics/src/lib.rs and the two sets must be changed together.
 export const FRAME_DURATION = 1000 / 60
-export const PARTICLE_RADIUS = 1.8
 export const FULL_BRIGHTNESS_SPEED = 6
 
 // Control surface, owned entirely by the main thread.
@@ -25,7 +24,7 @@ export const MESSAGE_READY = 'ready'
 export const MESSAGE_SNAPSHOT = 'snapshot'
 
 export const SNAPSHOT_HEADER_BYTES = 16
-const SNAPSHOT_BYTES_PER_PARTICLE = 14
+const SNAPSHOT_BYTES_PER_PARTICLE = 18
 /** Set when the main thread must not interpolate from its previous snapshot. */
 export const SNAPSHOT_FLAG_DISCONTINUOUS = 1
 export const PARTICLE_FLAG_RESPAWNED = 1
@@ -50,7 +49,8 @@ export function createSnapshotViews(buffer, count) {
     header: new Uint32Array(buffer, 0, 4),
     positions: new Float32Array(buffer, SNAPSHOT_HEADER_BYTES, count * 2),
     speeds: new Float32Array(buffer, SNAPSHOT_HEADER_BYTES + count * 8, count),
-    colors: new Uint8Array(buffer, SNAPSHOT_HEADER_BYTES + count * 12, count),
-    flags: new Uint8Array(buffer, SNAPSHOT_HEADER_BYTES + count * 13, count),
+    radii: new Float32Array(buffer, SNAPSHOT_HEADER_BYTES + count * 12, count),
+    colors: new Uint8Array(buffer, SNAPSHOT_HEADER_BYTES + count * 16, count),
+    flags: new Uint8Array(buffer, SNAPSHOT_HEADER_BYTES + count * 17, count),
   }
 }

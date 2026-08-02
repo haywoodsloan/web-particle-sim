@@ -23,7 +23,6 @@ import {
   PARTICLE_FADE_SHIFT,
   PARTICLE_FLAG_RESPAWNED,
   PARTICLE_LIMIT_STEP,
-  PARTICLE_RADIUS,
   SNAPSHOT_FLAG_DISCONTINUOUS,
   WHITE_HOLE_POLARITY,
   clamp,
@@ -97,7 +96,7 @@ const frameRate = document.querySelector('#frame-rate')
 const tickRate = document.querySelector('#tick-rate')
 const controlStatus = document.querySelector('#control-status')
 const controlsDialog = document.querySelector('#controls-dialog')
-const context = createRenderer(canvas, PARTICLE_RADIUS)
+const context = createRenderer(canvas)
 const physicsWorker = new Worker(
   new URL('./physics.worker.js', import.meta.url),
   { type: 'module' },
@@ -443,6 +442,7 @@ function renderParticles(time, veilAlpha) {
     instanceData[offset + 4] = views.colors[index] / HUE_RESOLUTION
     instanceData[offset + 5] = getLightness(views.speeds[index])
     instanceData[offset + 6] = fade / PARTICLE_FADE_LEVELS
+    instanceData[offset + 7] = views.radii[index]
     renderX[index] = x
     renderY[index] = y
   }

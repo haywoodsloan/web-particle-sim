@@ -3,8 +3,8 @@
  * offscreen target so the motion trail survives between frames.
  */
 
-/** x, y of the streak tail and head, then hue, lightness and fade. */
-export const INSTANCE_FLOATS = 7
+/** x, y of the streak tail and head, then hue, lightness, fade and radius. */
+export const INSTANCE_FLOATS = 8
 
 /** How far the halo reaches past the particle edge, in radii. Widening this
  *  raises how much neighbouring emitters overlap without touching the peak. */
@@ -18,18 +18,19 @@ precision highp float;
 
 layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 segment;
-layout(location = 2) in vec3 shade;
+layout(location = 2) in vec4 shade;
 
 uniform vec2 viewport;
-uniform float radius;
 uniform float feather;
-uniform float glow;
+uniform float glowReach;
 uniform float haloPass;
 
 out vec2 pixel;
 flat out vec2 tail;
 flat out vec2 head;
 flat out vec3 color;
+flat out float coreRadius;
+flat out float haloWidth;
 
 /** Saturation is always full, so only hue and lightness vary. */
 vec3 hueToRgb(float hue, float lightness) {
@@ -59,6 +60,9 @@ void main() {
   tail = segment.xy;
   head = segment.zw;
   color = hueToRgb(shade.x, shade.y) * shade.z;
+  coreRadius = shade.w;
+  // A wider emitter throws light further, so reach scales with the particle.
+  haloWidth = shade.w * glowReach;
 
   vec2 axis = head - tail;
   float span = length(axis);
@@ -66,7 +70,7 @@ void main() {
   vec2 side = vec2(-forward.y, forward.x);
   // Padded past the radius, or the quad clips off its own soft edge. Only the
   // halo pass needs the wider footprint.
-  float extent = radius + feather + glow * haloPass;
+  float extent = coreRadius + feather + haloWidth * haloPass;
 
   pixel =
     tail +
@@ -88,10 +92,10 @@ in vec2 pixel;
 flat in vec2 tail;
 flat in vec2 head;
 flat in vec3 color;
+flat in float coreRadius;
+flat in float haloWidth;
 
-uniform float radius;
 uniform float feather;
-uniform float glow;
 uniform float glowStrength;
 uniform float haloPass;
 
@@ -104,7 +108,7 @@ void main() {
   float distance = length(toPixel - axis * along);
   // Ramp centred on the edge, so coverage matches a rasterised stroke instead
   // of eroding the particle inward.
-  float core = 1.0 - smoothstep(radius - feather, radius + feather, distance);
+  float core = 1.0 - smoothstep(coreRadius - feather, coreRadius + feather, distance);
 
   if (haloPass < 0.5) {
     if (core <= 0.0) {
@@ -117,7 +121,7 @@ void main() {
 
   // Squared for a softer knee, and compactly supported so the quad edge never
   // shows as a seam.
-  float falloff = 1.0 - smoothstep(radius, radius + glow, distance);
+  float falloff = 1.0 - smoothstep(coreRadius, coreRadius + haloWidth, distance);
   float halo = falloff * falloff * glowStrength;
 
   if (halo <= 0.0) {
@@ -214,7 +218,7 @@ function link(gl, vertexSource, fragmentSource) {
   return program
 }
 
-export function createRenderer(canvas, radius) {
+export function createRenderer(canvas) {
   const gl = canvas.getContext('webgl2', {
     alpha: false,
     antialias: false,
@@ -249,9 +253,8 @@ export function createRenderer(canvas, radius) {
     : { internalFormat: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE }
   const particleUniforms = {
     viewport: gl.getUniformLocation(particleProgram, 'viewport'),
-    radius: gl.getUniformLocation(particleProgram, 'radius'),
     feather: gl.getUniformLocation(particleProgram, 'feather'),
-    glow: gl.getUniformLocation(particleProgram, 'glow'),
+    glowReach: gl.getUniformLocation(particleProgram, 'glowReach'),
     glowStrength: gl.getUniformLocation(particleProgram, 'glowStrength'),
     haloPass: gl.getUniformLocation(particleProgram, 'haloPass'),
   }
@@ -290,7 +293,7 @@ export function createRenderer(canvas, radius) {
   gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0)
   gl.vertexAttribDivisor(1, 1)
   gl.enableVertexAttribArray(2)
-  gl.vertexAttribPointer(2, 3, gl.FLOAT, false, stride, 16)
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 16)
   gl.vertexAttribDivisor(2, 1)
 
   const veilArray = gl.createVertexArray()
@@ -366,8 +369,7 @@ export function createRenderer(canvas, radius) {
 
       gl.useProgram(particleProgram)
       gl.uniform2f(particleUniforms.viewport, width, height)
-      gl.uniform1f(particleUniforms.radius, radius)
-      gl.uniform1f(particleUniforms.glow, radius * GLOW_REACH)
+      gl.uniform1f(particleUniforms.glowReach, GLOW_REACH)
       gl.uniform1f(particleUniforms.glowStrength, GLOW_STRENGTH)
       // Half a device pixel either side of the edge, in the CSS pixels the
       // shader measures distance in.
