@@ -3,24 +3,33 @@
  * offscreen target so the motion trail survives between frames.
  */
 
-/** x, y of the streak tail and head, then hue, lightness and fade. */
-export const INSTANCE_FLOATS = 7
+/** x, y of the streak tail and head, then hue, lightness, fade and glow. */
+export const INSTANCE_FLOATS = 8
+
+/** How far the halo reaches past the particle edge, in radii. */
+const GLOW_REACH = 3.5
+/** Peak halo brightness, at full speed. Trails accumulate the halo across
+ *  frames, so this stays well under one. */
+const GLOW_STRENGTH = 0.15
 
 const PARTICLE_VERTEX_SHADER = `#version 300 es
 precision highp float;
 
 layout(location = 0) in vec2 corner;
 layout(location = 1) in vec4 segment;
-layout(location = 2) in vec3 shade;
+layout(location = 2) in vec4 shade;
 
 uniform vec2 viewport;
 uniform float radius;
 uniform float feather;
+uniform float glow;
+uniform float haloPass;
 
 out vec2 pixel;
 flat out vec2 tail;
 flat out vec2 head;
 flat out vec3 color;
+flat out float glowScale;
 
 /** Saturation is always full, so only hue and lightness vary. */
 vec3 hueToRgb(float hue, float lightness) {
@@ -50,13 +59,15 @@ void main() {
   tail = segment.xy;
   head = segment.zw;
   color = hueToRgb(shade.x, shade.y) * shade.z;
+  glowScale = shade.w;
 
   vec2 axis = head - tail;
   float span = length(axis);
   vec2 forward = span > 0.0001 ? axis / span : vec2(1.0, 0.0);
   vec2 side = vec2(-forward.y, forward.x);
-  // Padded past the radius, or the quad clips off its own soft edge.
-  float extent = radius + feather;
+  // Padded past the radius, or the quad clips off its own soft edge. Only the
+  // halo pass needs the wider footprint.
+  float extent = radius + feather + glow * haloPass;
 
   pixel =
     tail +
@@ -78,9 +89,13 @@ in vec2 pixel;
 flat in vec2 tail;
 flat in vec2 head;
 flat in vec3 color;
+flat in float glowScale;
 
 uniform float radius;
 uniform float feather;
+uniform float glow;
+uniform float glowStrength;
+uniform float haloPass;
 
 out vec4 fragment;
 
@@ -91,13 +106,29 @@ void main() {
   float distance = length(toPixel - axis * along);
   // Ramp centred on the edge, so coverage matches a rasterised stroke instead
   // of eroding the particle inward.
-  float alpha = 1.0 - smoothstep(radius - feather, radius + feather, distance);
+  float core = 1.0 - smoothstep(radius - feather, radius + feather, distance);
 
-  if (alpha <= 0.0) {
+  if (haloPass < 0.5) {
+    if (core <= 0.0) {
+      discard;
+    }
+
+    fragment = vec4(color * core, core);
+    return;
+  }
+
+  // Squared for a softer knee, and compactly supported so the quad edge never
+  // shows as a seam.
+  float falloff = 1.0 - smoothstep(radius, radius + glow, distance);
+  float halo = falloff * falloff * glowStrength * glowScale;
+
+  if (halo <= 0.0) {
     discard;
   }
 
-  fragment = vec4(color * alpha, alpha);
+  // Zero coverage, so this only ever adds to the cores and halos already laid
+  // down. Overlapping glow in a cluster piles up instead of being replaced.
+  fragment = vec4(color * halo, 0.0);
 }`
 
 const VEIL_VERTEX_SHADER = `#version 300 es
@@ -141,8 +172,17 @@ uniform sampler2D trail;
 
 out vec4 fragment;
 
+/** Emitters accumulate past full brightness, so the top end is rolled off
+ *  instead of clipped. Linear below the knee keeps a lone particle's colour. */
+vec3 toneMap(vec3 light) {
+  const float knee = 0.8;
+  vec3 over = max(light - knee, vec3(0.0));
+
+  return min(light, vec3(knee)) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
+}
+
 void main() {
-  fragment = vec4(texture(trail, uv).rgb, 1.0);
+  fragment = vec4(toneMap(texture(trail, uv).rgb), 1.0);
 }`
 
 function compile(gl, type, source) {
@@ -194,14 +234,24 @@ export function createRenderer(canvas, radius) {
   const veilProgram = link(gl, VEIL_VERTEX_SHADER, VEIL_FRAGMENT_SHADER)
   const copyProgram = link(gl, COPY_VERTEX_SHADER, COPY_FRAGMENT_SHADER)
   // Multiplicative decay on an 8 bit target rounds back up and leaves a
-  // permanent smear, so the trail accumulates at half float precision.
-  const trailFormat = gl.getExtension('EXT_color_buffer_float')
-    ? gl.RGBA16F
-    : gl.RGBA8
+  // permanent smear, so the trail accumulates at float precision. Blending
+  // only ever reads source alpha, so the packed no-alpha format is enough and
+  // halves the trail's memory. It is no faster: the fullscreen passes are fill
+  // bound rather than bandwidth bound.
+  const trail = gl.getExtension('EXT_color_buffer_float')
+    ? {
+        internalFormat: gl.R11F_G11F_B10F,
+        format: gl.RGB,
+        type: gl.HALF_FLOAT,
+      }
+    : { internalFormat: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE }
   const particleUniforms = {
     viewport: gl.getUniformLocation(particleProgram, 'viewport'),
     radius: gl.getUniformLocation(particleProgram, 'radius'),
     feather: gl.getUniformLocation(particleProgram, 'feather'),
+    glow: gl.getUniformLocation(particleProgram, 'glow'),
+    glowStrength: gl.getUniformLocation(particleProgram, 'glowStrength'),
+    haloPass: gl.getUniformLocation(particleProgram, 'haloPass'),
   }
   const veilUniforms = { fade: gl.getUniformLocation(veilProgram, 'fade') }
 
@@ -238,7 +288,7 @@ export function createRenderer(canvas, radius) {
   gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 0)
   gl.vertexAttribDivisor(1, 1)
   gl.enableVertexAttribArray(2)
-  gl.vertexAttribPointer(2, 3, gl.FLOAT, false, stride, 16)
+  gl.vertexAttribPointer(2, 4, gl.FLOAT, false, stride, 16)
   gl.vertexAttribDivisor(2, 1)
 
   const veilArray = gl.createVertexArray()
@@ -270,12 +320,12 @@ export function createRenderer(canvas, radius) {
       gl.texImage2D(
         gl.TEXTURE_2D,
         0,
-        trailFormat,
+        trail.internalFormat,
         canvas.width,
         canvas.height,
         0,
-        gl.RGBA,
-        trailFormat === gl.RGBA16F ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE,
+        trail.format,
+        trail.type,
         null,
       )
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
@@ -297,6 +347,8 @@ export function createRenderer(canvas, radius) {
       gl.useProgram(particleProgram)
       gl.uniform2f(particleUniforms.viewport, width, height)
       gl.uniform1f(particleUniforms.radius, radius)
+      gl.uniform1f(particleUniforms.glow, radius * GLOW_REACH)
+      gl.uniform1f(particleUniforms.glowStrength, GLOW_STRENGTH)
       // Half a device pixel either side of the edge, in the CSS pixels the
       // shader measures distance in.
       gl.uniform1f(particleUniforms.feather, 0.5 / pixelRatio)
@@ -332,6 +384,11 @@ export function createRenderer(canvas, radius) {
           instanceCount * INSTANCE_FLOATS,
         )
         gl.useProgram(particleProgram)
+        // Cores first, so the halos that follow add on top of neighbours
+        // instead of being covered by them.
+        gl.uniform1f(particleUniforms.haloPass, 0)
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount)
+        gl.uniform1f(particleUniforms.haloPass, 1)
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, instanceCount)
       }
 

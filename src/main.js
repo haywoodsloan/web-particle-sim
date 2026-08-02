@@ -54,6 +54,10 @@ const getLightness = (speed) =>
   (MAX_LIGHTNESS - MIN_LIGHTNESS) *
     Math.sqrt(clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1))
 
+/** Squared rather than the lightness ramp's root, so a drifting particle keeps
+ *  a clean edge and only the quick ones trail a halo. */
+const getGlow = (speed) => clamp(speed / FULL_BRIGHTNESS_SPEED, 0, 1) ** 2
+
 document.querySelector('#app').innerHTML = `
   <canvas
     id="particle-canvas"
@@ -442,6 +446,7 @@ function renderParticles(time, veilAlpha) {
     instanceData[offset + 4] = views.colors[index] / HUE_RESOLUTION
     instanceData[offset + 5] = getLightness(views.speeds[index])
     instanceData[offset + 6] = fade / PARTICLE_FADE_LEVELS
+    instanceData[offset + 7] = getGlow(views.speeds[index])
     renderX[index] = x
     renderY[index] = y
   }
