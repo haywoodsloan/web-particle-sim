@@ -116,6 +116,8 @@ struct World {
     acceleration_y: Vec<f32>,
     radius: Vec<f32>,
     mass: Vec<f32>,
+    /// Spin about the centre, in radians per frame. Positive is anticlockwise.
+    angular_velocity: Vec<f32>,
     /// How hard the medium bites this particle, relative to a mid sized one.
     drag_scale: Vec<f32>,
     /// Velocity kept per substep, worked out once a step from the drag scale.
@@ -225,6 +227,7 @@ impl World {
         self.radius.resize(required, MIN_PARTICLE_RADIUS);
         self.mass
             .resize(required, mass_for(MIN_PARTICLE_RADIUS, 1.0));
+        self.angular_velocity.resize(required, 0.0);
         self.drag_scale.resize(required, 1.0);
         self.retained.resize(required, 1.0);
         self.color.resize(required, 0);
@@ -272,6 +275,7 @@ impl World {
         self.acceleration_y[index] = self.acceleration_y[last];
         self.radius[index] = self.radius[last];
         self.mass[index] = self.mass[last];
+        self.angular_velocity[index] = self.angular_velocity[last];
         self.drag_scale[index] = self.drag_scale[last];
         self.color[index] = self.color[last];
         self.fade[index] = self.fade[last];
@@ -396,6 +400,26 @@ impl World {
             self.velocity_y[first] -= impulse * inverse_first * normal_y;
             self.velocity_x[second] += impulse * inverse_second * normal_x;
             self.velocity_y[second] += impulse * inverse_second * normal_y;
+
+            let tangent_x = -normal_y;
+            let tangent_y = normal_x;
+            // Surfaces meet at the contact patch, so each spin adds its own rim
+            // speed. Reversing that is elastic exactly like the normal impulse,
+            // which is why grip trades energy with spin instead of burning it.
+            let surface = (self.velocity_x[first] - self.velocity_x[second]) * tangent_x
+                + (self.velocity_y[first] - self.velocity_y[second]) * tangent_y
+                + self.angular_velocity[first] * self.radius[first]
+                + self.angular_velocity[second] * self.radius[second];
+            // A uniform disc has I = m r^2 / 2, so r^2 / I is 2 / m and the
+            // tangent answers with three times the linear inverse mass.
+            let grip = -2.0 * surface / (3.0 * inverse_total);
+
+            self.velocity_x[first] += grip * inverse_first * tangent_x;
+            self.velocity_y[first] += grip * inverse_first * tangent_y;
+            self.velocity_x[second] -= grip * inverse_second * tangent_x;
+            self.velocity_y[second] -= grip * inverse_second * tangent_y;
+            self.angular_velocity[first] += 2.0 * grip * inverse_first / self.radius[first];
+            self.angular_velocity[second] += 2.0 * grip * inverse_second / self.radius[second];
         }
 
         // Split the same way, so a heavy particle barely yields to a light one.
@@ -957,6 +981,7 @@ impl World {
             self.random_between(MIN_DENSITY_SCALE, MAX_DENSITY_SCALE),
         );
         self.drag_scale[index] = radius / self.mass[index] / DRAG_REFERENCE;
+        self.angular_velocity[index] = 0.0;
         self.velocity_x[index] = (heading + spread).cos() * speed;
         self.velocity_y[index] = (heading + spread).sin() * speed;
         // Hue spans the whole byte, so the host can shade a continuous wheel.
@@ -1032,6 +1057,7 @@ impl World {
                 (self.velocity_x[index] + self.acceleration_x[index] * dt) * retained;
             self.velocity_y[index] =
                 (self.velocity_y[index] + self.acceleration_y[index] * dt) * retained;
+            self.angular_velocity[index] *= retained;
             self.x[index] += self.velocity_x[index] * dt;
             self.y[index] += self.velocity_y[index] * dt;
         }
@@ -1061,6 +1087,20 @@ impl World {
         (needed as usize).clamp(MIN_PHYSICS_SUBSTEPS, MAX_PHYSICS_SUBSTEPS)
     }
 
+    /// Reverses the contact patch velocity against a wall, the tangential twin
+    /// of the bounce. Elastic, so a particle can only trade speed for spin.
+    #[inline]
+    fn grip_wall(&mut self, index: usize, tangent_x: f32, tangent_y: f32) {
+        let radius = self.radius[index];
+        let surface = self.velocity_x[index] * tangent_x + self.velocity_y[index] * tangent_y
+            - self.angular_velocity[index] * radius;
+        let grip = -2.0 / 3.0 * surface;
+
+        self.velocity_x[index] += grip * tangent_x;
+        self.velocity_y[index] += grip * tangent_y;
+        self.angular_velocity[index] -= 2.0 * grip / radius;
+    }
+
     fn solve_walls(&mut self) {
         for index in 0..self.count {
             let radius = self.radius[index];
@@ -1073,11 +1113,13 @@ impl World {
                 self.x[index] = (2.0 * radius - self.x[index]).min(max_x);
                 if self.velocity_x[index] < 0.0 {
                     self.velocity_x[index] = -self.velocity_x[index];
+                    self.grip_wall(index, 0.0, 1.0);
                 }
             } else if self.x[index] > max_x {
                 self.x[index] = (2.0 * max_x - self.x[index]).max(radius);
                 if self.velocity_x[index] > 0.0 {
                     self.velocity_x[index] = -self.velocity_x[index];
+                    self.grip_wall(index, 0.0, -1.0);
                 }
             }
 
@@ -1085,11 +1127,13 @@ impl World {
                 self.y[index] = (2.0 * radius - self.y[index]).min(max_y);
                 if self.velocity_y[index] < 0.0 {
                     self.velocity_y[index] = -self.velocity_y[index];
+                    self.grip_wall(index, -1.0, 0.0);
                 }
             } else if self.y[index] > max_y {
                 self.y[index] = (2.0 * max_y - self.y[index]).max(radius);
                 if self.velocity_y[index] > 0.0 {
                     self.velocity_y[index] = -self.velocity_y[index];
+                    self.grip_wall(index, 1.0, 0.0);
                 }
             }
         }
