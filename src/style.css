@@ -189,6 +189,22 @@ body {
   background: rgba(0, 0, 0, 0.72);
 }
 
+/* Duration mirrors CONTROLS_FADE_MS in main.js. */
+#controls-dialog {
+  transition: opacity 1.5s ease;
+}
+
+/* Fading happens after modal state is dropped, which hands the page back but
+   takes the backdrop and the automatic centring with it. */
+#controls-dialog.is-dismissing {
+  position: fixed;
+  inset: 0;
+  width: fit-content;
+  height: fit-content;
+  opacity: 0;
+  pointer-events: none;
+}
+
 #controls-dialog h1 {
   margin: 0 0 22px;
   font-size: 34px;

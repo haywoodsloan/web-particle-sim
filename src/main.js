@@ -215,11 +215,34 @@ function toggleStats() {
   statsSince = performance.now()
 }
 
+const CONTROLS_FADE_MS = 1500
+
+let isControlsFading = false
+
+function dismissControls() {
+  if (isControlsFading) {
+    return
+  }
+
+  isControlsFading = true
+
+  // A modal dialog makes the rest of the page inert, so it has to be reopened
+  // non-modally or the field stays dead for the whole fade.
+  controlsDialog.close()
+  controlsDialog.show()
+  requestAnimationFrame(() => controlsDialog.classList.add('is-dismissing'))
+  setTimeout(() => {
+    controlsDialog.close()
+    controlsDialog.classList.remove('is-dismissing')
+    isControlsFading = false
+  }, CONTROLS_FADE_MS)
+}
+
 function handleKeyDown(event) {
-  // The dialog owns the keyboard while it is open.
-  if (controlsDialog.open) {
+  // The dialog owns the keyboard while it is open, but not once it is fading.
+  if (controlsDialog.open && !isControlsFading) {
     if (event.key === 'Escape') {
-      controlsDialog.close()
+      dismissControls()
     }
 
     return
@@ -556,7 +579,7 @@ const initialSnapshotBuffers = Array.from(
 configureCanvas()
 document
   .querySelector('#controls-dismiss')
-  .addEventListener('click', () => controlsDialog.close())
+  .addEventListener('click', dismissControls)
 
 // The isolation shim reloads the page on a first visit, so hold the intro back
 // rather than show it, lose it to the reload, and show it again.
