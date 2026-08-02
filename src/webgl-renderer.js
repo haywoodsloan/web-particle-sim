@@ -178,7 +178,9 @@ out vec4 fragment;
 /** Emitters accumulate past full brightness, so the top end is rolled off
  *  instead of clipped. Linear below the knee keeps a lone particle's colour,
  *  and the reciprocal shoulder keeps piled-up light separable far longer than
- *  an exponential one, which saturates almost immediately. */
+ *  an exponential one, which saturates almost immediately. Accumulating in
+ *  display space rather than linear is deliberate: it is what the glow is
+ *  tuned against. */
 vec3 toneMap(vec3 light) {
   const float knee = 0.75;
   const float shoulder = 1.0 - knee;

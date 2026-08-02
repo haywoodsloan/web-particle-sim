@@ -102,10 +102,10 @@ fn mass_for(radius: f32, density_scale: f32) -> f32 {
 }
 
 #[inline]
-fn hash_cell(cell_x: i32, cell_y: i32) -> usize {
+fn hash_cell(cell_x: i32, cell_y: i32) -> u32 {
     let x = (cell_x as u32).wrapping_mul(0x9E37_79B1);
     let y = (cell_y as u32).wrapping_mul(0x85EB_CA77);
-    (x ^ y) as usize
+    x ^ y
 }
 
 #[derive(Default)]
@@ -384,12 +384,20 @@ impl World {
         }
     }
 
+    /// Masked rather than shifted: taking the high bits spreads cells more
+    /// evenly but scatters a 3x3 neighbourhood across the table, and the lost
+    /// locality measures worse than the collisions it saves.
+    #[inline]
+    fn bucket_for(&self, cell_x: i32, cell_y: i32) -> usize {
+        hash_cell(cell_x, cell_y) as usize & self.grid_mask
+    }
+
     #[inline]
     fn bucket_of(&self, x: f32, y: f32) -> usize {
         let cell_x = (x * INVERSE_CELL_SIZE).floor() as i32;
         let cell_y = (y * INVERSE_CELL_SIZE).floor() as i32;
 
-        hash_cell(cell_x, cell_y) & self.grid_mask
+        self.bucket_for(cell_x, cell_y)
     }
 
     // ---- contacts ----------------------------------------------------------
@@ -471,7 +479,7 @@ impl World {
 
             for offset_y in -1..=1 {
                 for offset_x in -1..=1 {
-                    let bucket = hash_cell(cell_x + offset_x, cell_y + offset_y) & self.grid_mask;
+                    let bucket = self.bucket_for(cell_x + offset_x, cell_y + offset_y);
                     let start = self.grid_start[bucket] as usize;
                     let end = self.grid_start[bucket + 1] as usize;
 
@@ -854,7 +862,14 @@ impl World {
     fn accumulate_field(&mut self) {
         let recording = self.count > 1 && !self.has_interactions;
 
-        dispatch_field(self, recording);
+        // Helpers are parked here, so growing the record list cannot pull the
+        // backing store out from under them.
+        #[cfg(target_feature = "atomics")]
+        self.ensure_records(pool::worker_slots());
+
+        // Downgraded to a shared borrow for the dispatch: helpers hold one too,
+        // and everything written past here goes through raw pointers.
+        dispatch_field(&*self, recording);
 
         if recording {
             self.has_interactions = true;
@@ -886,7 +901,7 @@ impl World {
 
         for offset_y in -1..=1 {
             for offset_x in -1..=1 {
-                let bucket = hash_cell(cell_x + offset_x, cell_y + offset_y) & self.grid_mask;
+                let bucket = self.bucket_for(cell_x + offset_x, cell_y + offset_y);
                 let start = self.grid_start[bucket] as usize;
                 let end = self.grid_start[bucket + 1] as usize;
 
@@ -1149,6 +1164,8 @@ impl World {
 
             // A field held stale for a whole frame drains energy from particles
             // orbiting inside a cluster, so it is only held for a substep or two.
+            // Applying it symmetrically across the block measures worse, because
+            // the contact solver between the halves is not itself reversible.
             if self.count > 0 && substep % SUBSTEPS_PER_FIELD_UPDATE == 0 {
                 self.accumulate_field();
             }
@@ -1313,7 +1330,7 @@ fn field_slice(world: &World, slot: usize, start: usize, end: usize, recording: 
 }
 
 #[cfg(not(target_feature = "atomics"))]
-fn dispatch_field(world: &mut World, recording: bool) {
+fn dispatch_field(world: &World, recording: bool) {
     field_slice(world, 0, 0, world.count, recording);
 }
 
@@ -1354,25 +1371,37 @@ mod pool {
         SPIN_BUDGET / WORKER_TOTAL.load(Ordering::Relaxed).max(1)
     }
 
-    fn slice_bounds(index: usize, workers: usize, count: usize) -> (usize, usize) {
-        let share = count.div_ceil(workers);
-        let start = (index * share).min(count);
+    /// A 64 byte cache line holds sixteen f32s. Boundaries are rounded to that
+    /// so two workers never write the same line of the acceleration arrays.
+    const LANE_PARTICLES: usize = 16;
 
-        (start, (start + share).min(count))
+    pub(super) fn worker_slots() -> usize {
+        WORKER_TOTAL.load(Ordering::Relaxed).max(1) as usize
+    }
+
+    fn slice_bounds(index: usize, workers: usize, count: usize) -> (usize, usize) {
+        // Hand out whole lanes rather than rounding the share up, which would
+        // lengthen the longest slice and cost more than the sharing it avoids.
+        let lanes = count.div_ceil(LANE_PARTICLES);
+        let base = lanes / workers;
+        let extra = lanes % workers;
+        let first = index * base + index.min(extra);
+        let last = first + base + usize::from(index < extra);
+
+        (
+            (first * LANE_PARTICLES).min(count),
+            (last * LANE_PARTICLES).min(count),
+        )
     }
 
     /// Publishes a job to the pool, takes the first slice, then waits.
-    pub(super) fn dispatch_field(world: &mut World, recording: bool) {
+    pub(super) fn dispatch_field(world: &World, recording: bool) {
         let workers = WORKER_TOTAL.load(Ordering::Relaxed).max(1);
 
         if workers == 1 || world.count < MIN_PARALLEL_PARTICLES {
             field_slice(world, 0, 0, world.count, recording);
             return;
         }
-
-        // Helpers are parked here, so growing the record list cannot pull the
-        // backing store out from under them.
-        world.ensure_records(workers as usize);
 
         FIELD_RECORDING.store(u32::from(recording), Ordering::Release);
         FIELD_DONE.store(0, Ordering::Release);
@@ -1454,7 +1483,7 @@ mod pool {
 
             seen = FIELD_EPOCH.load(Ordering::Acquire);
 
-            let world: &World = world();
+            let world = world_shared();
             let workers = WORKER_TOTAL.load(Ordering::Relaxed).max(1) as usize;
             let recording = FIELD_RECORDING.load(Ordering::Acquire) != 0;
             let (start, end) = slice_bounds(index as usize, workers, world.count);
@@ -1485,6 +1514,15 @@ static WORLD: GlobalWorld = GlobalWorld(UnsafeCell::new(None));
 fn world() -> &'static mut World {
     // SAFETY: no other borrow can be live while this one is handed out.
     unsafe { (*WORLD.0.get()).get_or_insert_with(World::new) }
+}
+
+/// What helper threads use. Nothing hands out a mutable borrow while a field
+/// dispatch is in flight, so these shared ones never alias one.
+#[cfg(target_feature = "atomics")]
+fn world_shared() -> &'static World {
+    // SAFETY: the world exists by the time any helper is running, and the host
+    // holds only a shared borrow for the duration of a dispatch.
+    unsafe { (*WORLD.0.get()).as_ref().unwrap_unchecked() }
 }
 
 #[unsafe(no_mangle)]
