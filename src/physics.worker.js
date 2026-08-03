@@ -11,6 +11,7 @@ import {
   MESSAGE_RECYCLE_BUFFER,
   MESSAGE_RESIZE,
   MESSAGE_SNAPSHOT,
+  MESSAGE_TIME_REVERSED,
   MESSAGE_VISIBILITY,
 } from './simulation-shared.js'
 import initialisePhysics from './physics.wasm?init'
@@ -260,6 +261,10 @@ self.onmessage = ({ data }) => {
 
     case MESSAGE_AIR_RESISTANCE:
       physics.set_air_resistance(data.percent)
+      break
+
+    case MESSAGE_TIME_REVERSED:
+      physics.set_time_reversed(data.reversed ? 1 : 0)
       break
 
     case MESSAGE_PARTICLE_LIMIT:

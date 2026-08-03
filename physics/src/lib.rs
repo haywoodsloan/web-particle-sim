@@ -17,6 +17,9 @@ const MAX_WORLD_GRAVITY: f32 = 1.0;
 const MAX_AIR_RESISTANCE: f32 = 0.03;
 const GRAVITY_SCALE: f32 = 0.001;
 const MAX_PARTICLES_PER_FRAME: f32 = 10.0;
+/// Spray is quoted against this limit and scales from it, so raising the limit
+/// fills the field in a comparable time rather than a proportionally longer one.
+const SPRAY_REFERENCE_LIMIT: f32 = 500.0;
 const EMISSION_VELOCITY_SCALE: f32 = 0.4;
 const PARTICLE_GRAVITY: f32 = 0.15;
 const PARTICLE_GRAVITY_SOFTENING: f32 = 4.0;
@@ -72,7 +75,9 @@ const SPAWN_PLACEMENT_ATTEMPTS: usize = 8;
 /// The step rate is fixed, so this is 225 ms on any display.
 const RETIRE_FADE_FRAMES: f32 = 13.5;
 const RETIRE_FADE_LEVELS: f32 = 7.0;
-/// Past this backlog the longest-running fades are cut short.
+/// Past this backlog the longest-running fades are cut short. Quoted against
+/// SPRAY_REFERENCE_LIMIT and scaled with the limit like the spray is, or a big
+/// field retires faster than it can fade and the tails get clipped.
 const MAX_RETIRING: usize = 250;
 
 /// Constant-folded; `sqrt` cannot run in a `const` initialiser.
@@ -176,6 +181,10 @@ struct World {
     /// result matches running the whole range on one thread.
     records: Vec<Record>,
     has_interactions: bool,
+    /// +1 or -1. A reversed step runs the adjoint of the forward one, and
+    /// every test that asks whether a pair or a wall is closing reads a
+    /// velocity, so those have to be flipped alongside it.
+    time_direction: f32,
 
     batch_x: Vec<f32>,
     batch_y: Vec<f32>,
@@ -219,6 +228,7 @@ impl World {
             rng: 0x2545_F491,
             records: vec![Record::default()],
             snapshot: vec![0; SNAPSHOT_HEADER_BYTES],
+            time_direction: 1.0,
             ..Self::default()
         }
     }
@@ -342,15 +352,22 @@ impl World {
         }
     }
 
+    fn max_retiring(&self) -> usize {
+        ((MAX_RETIRING as f32 * self.limit as f32 / SPRAY_REFERENCE_LIMIT) as usize).max(1)
+    }
+
     fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
-        self.ensure_capacity(limit + MAX_RETIRING);
+
+        let max_retiring = self.max_retiring();
+
+        self.ensure_capacity(limit + max_retiring);
 
         while self.alive_count > limit {
             self.retire_oldest_alive();
         }
 
-        while self.count - self.alive_count > MAX_RETIRING {
+        while self.count - self.alive_count > self.max_retiring() {
             self.drop_longest_fade();
         }
     }
@@ -424,7 +441,7 @@ impl World {
 
         // Fully elastic impulse. With equal masses it reduces to trading the
         // normal components; unequal ones recoil in proportion to their mass.
-        if approach < 0.0 {
+        if approach * self.time_direction < 0.0 {
             let impulse = -2.0 * approach / inverse_total;
 
             self.velocity_x[first] -= impulse * inverse_first * normal_x;
@@ -855,7 +872,9 @@ impl World {
         if scale <= 0.0 {
             0.0
         } else {
-            scale * self.hole_polarity
+            // Flipped with time so a well still throws particles out rather
+            // than briefly expelling them and then drawing them back in.
+            scale * self.hole_polarity * self.time_direction
         }
     }
 
@@ -961,7 +980,7 @@ impl World {
             self.retire_oldest_alive();
         }
 
-        while self.count - self.alive_count > MAX_RETIRING {
+        while self.count - self.alive_count > self.max_retiring() {
             self.drop_longest_fade();
         }
 
@@ -1018,10 +1037,11 @@ impl World {
         let speed_per_millisecond = distance / elapsed;
         let pointer_speed = clamp(speed_per_millisecond * FRAME_DURATION, 1.4, 8.0);
         let spawn_ratio = clamp((speed_per_millisecond * 1000.0 - 30.0) / 1000.0, 0.0, 1.0);
-        let spawn_rate = 300.0 * spawn_ratio.powf(1.35);
+        let spray_scale = self.limit as f32 / SPRAY_REFERENCE_LIMIT;
+        let spawn_rate = 300.0 * spray_scale * spawn_ratio.powf(1.35);
 
-        self.spawn_budget =
-            (self.spawn_budget + spawn_rate * (elapsed / 1000.0)).min(MAX_PARTICLES_PER_FRAME);
+        self.spawn_budget = (self.spawn_budget + spawn_rate * (elapsed / 1000.0))
+            .min(MAX_PARTICLES_PER_FRAME * spray_scale);
 
         let particle_count = self.spawn_budget.floor();
 
@@ -1064,6 +1084,44 @@ impl World {
         }
     }
 
+    /// The adjoint of `integrate` undoes its halves in the opposite order, so
+    /// the drift runs first and the field is sampled between the two: the kick
+    /// it cancels was the one taken from the position this lands on.
+    fn drift_back(&mut self, dt: f32) {
+        for index in 0..self.count {
+            self.x[index] -= self.velocity_x[index] * dt;
+            self.y[index] -= self.velocity_y[index] * dt;
+        }
+    }
+
+    fn kick_back(&mut self, dt: f32) {
+        for index in 0..self.count {
+            let retained = self.retained[index];
+
+            self.velocity_x[index] =
+                self.velocity_x[index] / retained - self.acceleration_x[index] * dt;
+            self.velocity_y[index] =
+                self.velocity_y[index] / retained - self.acceleration_y[index] * dt;
+            self.angular_velocity[index] /= retained;
+        }
+    }
+
+    fn refresh_field(&mut self, substep: usize) {
+        // Sources barely shift within a frame, so one tree serves the whole
+        // step and later substeps replay the sets recorded against it.
+        if substep == 0 && self.count > 1 {
+            self.build_gravity_tree();
+        }
+
+        // A field held stale for a whole frame drains energy from particles
+        // orbiting inside a cluster, so it is only held for a substep or two.
+        // Applying it symmetrically across the block measures worse, because
+        // the contact solver between the halves is not itself reversible.
+        if self.count > 0 && substep.is_multiple_of(SUBSTEPS_PER_FIELD_UPDATE) {
+            self.accumulate_field();
+        }
+    }
+
     /// A pair passes straight through each other when either crosses their
     /// combined radii inside one substep. Sizing that against a typical partner
     /// rather than the smallest keeps the rate down; the residual overlap it
@@ -1103,6 +1161,8 @@ impl World {
     }
 
     fn solve_walls(&mut self) {
+        let direction = self.time_direction;
+
         for index in 0..self.count {
             let radius = self.radius[index];
             let max_x = (self.width - radius).max(radius);
@@ -1112,13 +1172,13 @@ impl World {
             // where it belongs; clamped in case a resize left it far outside.
             if self.x[index] < radius {
                 self.x[index] = (2.0 * radius - self.x[index]).min(max_x);
-                if self.velocity_x[index] < 0.0 {
+                if self.velocity_x[index] * direction < 0.0 {
                     self.velocity_x[index] = -self.velocity_x[index];
                     self.grip_wall(index, 0.0, 1.0);
                 }
             } else if self.x[index] > max_x {
                 self.x[index] = (2.0 * max_x - self.x[index]).max(radius);
-                if self.velocity_x[index] > 0.0 {
+                if self.velocity_x[index] * direction > 0.0 {
                     self.velocity_x[index] = -self.velocity_x[index];
                     self.grip_wall(index, 0.0, -1.0);
                 }
@@ -1126,13 +1186,13 @@ impl World {
 
             if self.y[index] < radius {
                 self.y[index] = (2.0 * radius - self.y[index]).min(max_y);
-                if self.velocity_y[index] < 0.0 {
+                if self.velocity_y[index] * direction < 0.0 {
                     self.velocity_y[index] = -self.velocity_y[index];
                     self.grip_wall(index, -1.0, 0.0);
                 }
             } else if self.y[index] > max_y {
                 self.y[index] = (2.0 * max_y - self.y[index]).max(radius);
-                if self.velocity_y[index] > 0.0 {
+                if self.velocity_y[index] * direction > 0.0 {
                     self.velocity_y[index] = -self.velocity_y[index];
                     self.grip_wall(index, 1.0, 0.0);
                 }
@@ -1156,20 +1216,18 @@ impl World {
         self.expire_fades();
 
         for substep in 0..substeps {
-            // Sources barely shift within a frame, so one tree serves the whole
-            // step and later substeps replay the sets recorded against it.
-            if substep == 0 && self.count > 1 {
-                self.build_gravity_tree();
+            // A step is undone by undoing its parts in the opposite order, so
+            // the solvers run before the integrator rather than after it.
+            if self.time_direction < 0.0 {
+                self.solve_walls();
+                self.solve_contacts();
+                self.drift_back(dt);
+                self.refresh_field(substep);
+                self.kick_back(dt);
+                continue;
             }
 
-            // A field held stale for a whole frame drains energy from particles
-            // orbiting inside a cluster, so it is only held for a substep or two.
-            // Applying it symmetrically across the block measures worse, because
-            // the contact solver between the halves is not itself reversible.
-            if self.count > 0 && substep % SUBSTEPS_PER_FIELD_UPDATE == 0 {
-                self.accumulate_field();
-            }
-
+            self.refresh_field(substep);
             self.integrate(dt);
             self.solve_contacts();
             self.solve_walls();
@@ -1562,6 +1620,14 @@ pub extern "C" fn set_gravity(percent: f32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn set_air_resistance(percent: f32) {
     world().air_percent = percent;
+}
+
+/// Reversing runs the adjoint of the forward step rather than a negated one:
+/// forces are re-sampled from position. Only the pointer well, which is an
+/// input rather than a state, flips with the direction.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_time_reversed(reversed: u32) {
+    world().time_direction = if reversed == 0 { 1.0 } else { -1.0 };
 }
 
 #[unsafe(no_mangle)]

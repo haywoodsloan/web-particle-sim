@@ -18,6 +18,7 @@ import {
   MESSAGE_RECYCLE_BUFFER,
   MESSAGE_RESIZE,
   MESSAGE_SNAPSHOT,
+  MESSAGE_TIME_REVERSED,
   MESSAGE_VISIBILITY,
   PARTICLE_FADE_LEVELS,
   PARTICLE_FADE_SHIFT,
@@ -83,6 +84,7 @@ document.querySelector('#app').innerHTML = `
       <dt>Left click</dt><dd>Gravity well</dd>
       <dt>Right click</dt><dd>Repulsion field</dd>
       <dt>Space</dt><dd>Toggle spray</dd>
+      <dt>Backspace</dt><dd>Reverse time (hold)</dd>
       <dt>-<span>/</span>=</dt><dd>Gravity</dd>
       <dt>[<span>/</span>]</dt><dd>Air resistance</dd>
       <dt>;<span>/</span>'</dt><dd>Particle limit</dd>
@@ -119,6 +121,7 @@ let viewportHeight = window.innerHeight
 let pixelRatio = 1
 let gravityPercent = 0
 let airResistancePercent = 0
+let isTimeReversed = false
 let isParticleEmissionEnabled = true
 let areStatsVisible = false
 let statsFrames = 0
@@ -195,6 +198,16 @@ function adjustAirResistance(direction) {
     percent: airResistancePercent,
   })
   showControlStatus(`Air Resistance: ${airResistancePercent}%`)
+}
+
+function setTimeReversed(reversed) {
+  if (reversed === isTimeReversed) {
+    return
+  }
+
+  isTimeReversed = reversed
+  sendToWorker({ type: MESSAGE_TIME_REVERSED, reversed })
+  showControlStatus(reversed ? 'Time: Reversed' : 'Time: Forward')
 }
 
 function adjustParticleLimit(direction) {
@@ -282,6 +295,9 @@ function handleKeyDown(event) {
       if (!event.repeat) {
         toggleParticleEmission()
       }
+      break
+    case 'Backspace':
+      setTimeReversed(true)
       break
     default:
       return
@@ -535,7 +551,17 @@ canvas.addEventListener('pointercancel', () => resetPointer())
 canvas.addEventListener('contextmenu', (event) => event.preventDefault())
 window.addEventListener('resize', resizeCanvas)
 window.addEventListener('keydown', handleKeyDown)
-window.addEventListener('blur', () => resetPointer())
+// Releasing over another window never reports a key up, which would otherwise
+// strand the field running backwards.
+window.addEventListener('keyup', (event) => {
+  if (event.key === 'Backspace') {
+    setTimeReversed(false)
+  }
+})
+window.addEventListener('blur', () => {
+  setTimeReversed(false)
+  resetPointer()
+})
 document.addEventListener('visibilitychange', () => {
   sendToWorker({
     type: MESSAGE_VISIBILITY,
