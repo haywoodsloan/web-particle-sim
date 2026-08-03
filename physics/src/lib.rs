@@ -872,9 +872,7 @@ impl World {
         if scale <= 0.0 {
             0.0
         } else {
-            // Flipped with time so a well still throws particles out rather
-            // than briefly expelling them and then drawing them back in.
-            scale * self.hole_polarity * self.time_direction
+            scale * self.hole_polarity
         }
     }
 
@@ -1217,13 +1215,14 @@ impl World {
 
         for substep in 0..substeps {
             // A step is undone by undoing its parts in the opposite order, so
-            // the solvers run before the integrator rather than after it.
+            // the solvers run before the integrator rather than after it. Walls
+            // close the substep either way, which is what the next one relies on.
             if self.time_direction < 0.0 {
-                self.solve_walls();
                 self.solve_contacts();
                 self.drift_back(dt);
                 self.refresh_field(substep);
                 self.kick_back(dt);
+                self.solve_walls();
                 continue;
             }
 
@@ -1240,6 +1239,19 @@ impl World {
     }
 
     fn expire_fades(&mut self) {
+        // Retiring runs backwards too, so rewinding brings a fading particle
+        // back up instead of finishing it off. One that is already gone cannot
+        // return, so the recovery stops at full rather than restoring it.
+        if self.time_direction < 0.0 {
+            for index in 0..self.count {
+                if self.fade[index].is_finite() {
+                    self.fade[index] = (self.fade[index] + 1.0).min(RETIRE_FADE_FRAMES);
+                }
+            }
+
+            return;
+        }
+
         let mut index = 0;
 
         while index < self.count {

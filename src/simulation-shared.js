@@ -24,7 +24,7 @@ export const MESSAGE_RECYCLE_BUFFER = 'recycleBuffer'
 export const MESSAGE_READY = 'ready'
 export const MESSAGE_SNAPSHOT = 'snapshot'
 
-export const SNAPSHOT_HEADER_BYTES = 16
+const SNAPSHOT_HEADER_BYTES = 16
 const SNAPSHOT_BYTES_PER_PARTICLE = 18
 /** Set when the main thread must not interpolate from its previous snapshot. */
 export const SNAPSHOT_FLAG_DISCONTINUOUS = 1
